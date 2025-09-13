@@ -3,6 +3,7 @@ package encryption
 import (
 	"crypto/rand"
 	"fmt"
+
 	"github.com/K9Crypt/k9crypt-go/src/constants"
 
 	"golang.org/x/crypto/argon2"
@@ -18,9 +19,9 @@ type Argon2Hasher struct {
 
 func NewArgon2Hasher() *Argon2Hasher {
 	return &Argon2Hasher{
-		time:    constants.Argon2Time,
-		memory:  constants.Argon2Memory,
-		threads: constants.Argon2Threads,
+		time:    1,
+		memory:  16 * 1024,
+		threads: 1,
 		saltLen: constants.Argon2SaltSize,
 		keyLen:  constants.Argon2HashLength,
 	}

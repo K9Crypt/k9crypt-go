@@ -10,12 +10,14 @@ import (
 type LzmaCompressor struct {
 	dictionary []byte
 	windowSize int
+	hashTable  map[uint32][]int
 }
 
 func NewLzmaCompressor() *LzmaCompressor {
 	return &LzmaCompressor{
-		dictionary: make([]byte, 1<<16),
-		windowSize: 1 << 16,
+		dictionary: make([]byte, 1<<17),
+		windowSize: 1 << 17,
+		hashTable:  make(map[uint32][]int),
 	}
 }
 
@@ -24,9 +26,9 @@ func (lzma *LzmaCompressor) Compress(data []byte) ([]byte, error) {
 		return nil, fmt.Errorf("input data cannot be empty")
 	}
 
-	var result bytes.Buffer
+	result := bytes.NewBuffer(make([]byte, 0, 131072))
 
-	err := lzma.writeHeader(&result, len(data))
+	err := lzma.writeHeader(result, len(data))
 	if err != nil {
 		return nil, fmt.Errorf("failed to write header: %w", err)
 	}
@@ -115,18 +117,20 @@ func (lzma *LzmaCompressor) readHeader(reader io.Reader) (int, error) {
 }
 
 func (lzma *LzmaCompressor) simpleCompress(data []byte) ([]byte, error) {
-	var result bytes.Buffer
+	result := bytes.NewBuffer(make([]byte, 0, 65536))
+
+	lzma.buildHashTable(data)
 
 	pos := 0
 	for pos < len(data) {
 		match := lzma.findLongestMatch(data, pos)
 
 		if match.length >= 3 && match.distance > 0 {
-			lzma.encodeMatch(&result, match.length, match.distance)
+			lzma.encodeMatch(result, match.length, match.distance)
 			pos += match.length
 		}
 		if match.length < 3 || match.distance == 0 {
-			lzma.encodeLiteral(&result, data[pos])
+			lzma.encodeLiteral(result, data[pos])
 			pos++
 		}
 	}
@@ -135,7 +139,7 @@ func (lzma *LzmaCompressor) simpleCompress(data []byte) ([]byte, error) {
 }
 
 func (lzma *LzmaCompressor) simpleDecompress(data []byte, originalSize int) ([]byte, error) {
-	var result bytes.Buffer
+	result := bytes.NewBuffer(make([]byte, 0, 131072))
 	reader := bytes.NewReader(data)
 
 	for result.Len() < originalSize {
@@ -193,17 +197,24 @@ func (lzma *LzmaCompressor) findLongestMatch(data []byte, pos int) Match {
 		return Match{length: 0, distance: 0}
 	}
 
+	hash := lzma.computeHash(data, pos)
+	candidates, exists := lzma.hashTable[hash]
+	if !exists {
+		return Match{length: 0, distance: 0}
+	}
+
 	bestLength := 0
 	bestDistance := 0
-	maxDistance := 4096
+	maxDistance := 131072
 
 	if pos < maxDistance {
 		maxDistance = pos
 	}
 
-	for distance := 1; distance <= maxDistance; distance++ {
-		if pos-distance < 0 {
-			break
+	for _, candidate := range candidates {
+		distance := pos - candidate
+		if distance > maxDistance || distance <= 0 {
+			continue
 		}
 
 		length := 0
@@ -214,16 +225,15 @@ func (lzma *LzmaCompressor) findLongestMatch(data []byte, pos int) Match {
 
 		for length < maxLength {
 			currentPos := pos + length
-			matchPos := pos - distance + length
+			matchPos := candidate + length
 
-			if currentPos >= len(data) || matchPos < 0 {
+			if currentPos >= len(data) || matchPos >= pos {
 				break
 			}
 
 			if data[currentPos] == data[matchPos] {
 				length++
-			}
-			if data[currentPos] != data[matchPos] {
+			} else {
 				break
 			}
 		}
@@ -251,6 +261,21 @@ func (lzma *LzmaCompressor) encodeMatch(writer *bytes.Buffer, length int, distan
 	distanceBytes := make([]byte, 2)
 	binary.LittleEndian.PutUint16(distanceBytes, uint16(distance))
 	writer.Write(distanceBytes)
+}
+
+func (lzma *LzmaCompressor) buildHashTable(data []byte) {
+	lzma.hashTable = make(map[uint32][]int)
+	for i := 0; i <= len(data)-3; i++ {
+		hash := lzma.computeHash(data, i)
+		lzma.hashTable[hash] = append(lzma.hashTable[hash], i)
+	}
+}
+
+func (lzma *LzmaCompressor) computeHash(data []byte, pos int) uint32 {
+	if pos+2 >= len(data) {
+		return 0
+	}
+	return uint32(data[pos]) | uint32(data[pos+1])<<8 | uint32(data[pos+2])<<16
 }
 
 func (lzma *LzmaCompressor) validateInput(data []byte) error {

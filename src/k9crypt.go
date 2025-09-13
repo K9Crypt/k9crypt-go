@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"fmt"
+
 	"github.com/K9Crypt/k9crypt-go/src/compression"
 	"github.com/K9Crypt/k9crypt-go/src/constants"
 	"github.com/K9Crypt/k9crypt-go/src/encryption"
@@ -76,7 +77,20 @@ func (k *K9Crypt) Encrypt(plaintext string) (string, error) {
 		return "", fmt.Errorf("hash generation failed: %w", err)
 	}
 
-	var buffer bytes.Buffer
+	buffer := bytes.NewBuffer(make([]byte, 0, 131072))
+	paddingSizeByte := make([]byte, 1)
+	_, err = rand.Read(paddingSizeByte)
+	if err != nil {
+		return "", fmt.Errorf("failed to generate padding size: %w", err)
+	}
+	paddingSize := byte(4 + int(paddingSizeByte[0])%13)
+	buffer.WriteByte(paddingSize)
+	padding := make([]byte, int(paddingSize))
+	_, err = rand.Read(padding)
+	if err != nil {
+		return "", fmt.Errorf("failed to generate padding: %w", err)
+	}
+	buffer.Write(padding)
 
 	saltLen := make([]byte, 4)
 	binary.LittleEndian.PutUint32(saltLen, uint32(len(salt)))
@@ -103,11 +117,23 @@ func (k *K9Crypt) Decrypt(encryptedData string) (string, error) {
 		return "", fmt.Errorf("invalid base64 data: %w", err)
 	}
 
-	if len(decodedData) < 8 {
+	if len(decodedData) < 13 { // minimum 1 + 4 + 8
 		return "", fmt.Errorf("invalid encrypted data format")
 	}
 
 	reader := bytes.NewReader(decodedData)
+
+	paddingSizeByte := make([]byte, 1)
+	_, err = reader.Read(paddingSizeByte)
+	if err != nil {
+		return "", fmt.Errorf("failed to read padding size: %w", err)
+	}
+	paddingSize := int(paddingSizeByte[0])
+	padding := make([]byte, paddingSize)
+	_, err = reader.Read(padding)
+	if err != nil {
+		return "", fmt.Errorf("failed to read padding: %w", err)
+	}
 
 	saltLenBytes := make([]byte, 4)
 	_, err = reader.Read(saltLenBytes)
@@ -135,7 +161,7 @@ func (k *K9Crypt) Decrypt(encryptedData string) (string, error) {
 		return "", fmt.Errorf("failed to read hash: %w", err)
 	}
 
-	remaining := make([]byte, len(decodedData)-8-int(saltLen)-int(hashLen))
+	remaining := make([]byte, len(decodedData)-(1+int(paddingSize))-8-int(saltLen)-int(hashLen))
 	_, err = reader.Read(remaining)
 	if err != nil {
 		return "", fmt.Errorf("failed to read encrypted data: %w", err)
@@ -175,13 +201,38 @@ func (k *K9Crypt) deriveKeys(password []byte, salt []byte) ([][]byte, error) {
 	}
 
 	keys := make([][]byte, 5)
+	keyChan := make(chan struct {
+		index int
+		key   []byte
+		err   error
+	}, 5)
+
 	for i := 0; i < 5; i++ {
-		keyMaterial := append(hashedMasterKey, byte(i))
-		keyHash, err := k.sha512Hasher.Hash(keyMaterial)
-		if err != nil {
-			return nil, fmt.Errorf("key %d derivation failed: %w", i+1, err)
+		go func(idx int) {
+			keyMaterial := append(hashedMasterKey, byte(idx))
+			keyHash, err := k.sha512Hasher.Hash(keyMaterial)
+			if err != nil {
+				keyChan <- struct {
+					index int
+					key   []byte
+					err   error
+				}{idx, nil, err}
+				return
+			}
+			keyChan <- struct {
+				index int
+				key   []byte
+				err   error
+			}{idx, keyHash[:constants.KeySize], nil}
+		}(i)
+	}
+
+	for i := 0; i < 5; i++ {
+		result := <-keyChan
+		if result.err != nil {
+			return nil, fmt.Errorf("key %d derivation failed: %w", result.index+1, result.err)
 		}
-		keys[i] = keyHash[:constants.KeySize]
+		keys[result.index] = result.key
 	}
 
 	return keys, nil

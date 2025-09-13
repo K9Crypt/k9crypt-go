@@ -8,6 +8,7 @@ import (
 	"hash/adler32"
 	"hash/crc32"
 	"io"
+
 	"github.com/K9Crypt/k9crypt-go/src/constants"
 )
 
@@ -26,12 +27,12 @@ func (z *ZlibCompressor) Compress(data []byte) ([]byte, error) {
 		return nil, fmt.Errorf("input data cannot be empty")
 	}
 
-	var compressed bytes.Buffer
+	compressed := bytes.NewBuffer(make([]byte, 0, 131072))
 
 	zlibHeader := []byte{0x78, 0x9c}
 	compressed.Write(zlibHeader)
 
-	deflateWriter, err := flate.NewWriter(&compressed, z.level)
+	deflateWriter, err := flate.NewWriter(compressed, z.level)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create deflate writer: %w", err)
 	}
@@ -67,8 +68,8 @@ func (z *ZlibCompressor) Decompress(data []byte) ([]byte, error) {
 	reader := bytes.NewReader(data[2 : len(data)-4])
 	deflateReader := flate.NewReader(reader)
 
-	var decompressed bytes.Buffer
-	_, err := io.Copy(&decompressed, deflateReader)
+	decompressed := bytes.NewBuffer(make([]byte, 0, 131072))
+	_, err := io.Copy(decompressed, deflateReader)
 	if err != nil {
 		deflateReader.Close()
 		return nil, fmt.Errorf("failed to decompress data: %w", err)
