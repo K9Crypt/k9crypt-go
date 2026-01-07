@@ -13,13 +13,18 @@ import (
 )
 
 type K9Crypt struct {
-	secretKey       []byte
-	aesEncryptor    *encryption.AesEncryptor
-	sha512Hasher    *encryption.Sha512Hasher
-	argon2Hasher    *encryption.Argon2Hasher
-	zlibCompressor  *compression.ZlibCompressor
-	lzmaCompressor  *compression.LzmaCompressor
-	compressionType constants.CompressionType
+	secretKey            []byte
+	aesEncryptor         *encryption.AesEncryptor
+	sha512Hasher         *encryption.Sha512Hasher
+	argon2Hasher         *encryption.Argon2Hasher
+	zlibCompressor       *compression.ZlibCompressor
+	lzmaCompressor       *compression.LzmaCompressor
+	compressionType      constants.CompressionType
+	defaultCompressionLevel int
+}
+
+type Options struct {
+	CompressionLevel int
 }
 
 func New(secretKey string) *K9Crypt {
@@ -34,14 +39,36 @@ func New(secretKey string) *K9Crypt {
 	}
 
 	return &K9Crypt{
-		secretKey:       keyBytes,
-		aesEncryptor:    encryption.NewAesEncryptor(),
-		sha512Hasher:    encryption.NewSha512Hasher(),
-		argon2Hasher:    encryption.NewArgon2Hasher(),
-		zlibCompressor:  compression.NewZlibCompressor(),
-		lzmaCompressor:  compression.NewLzmaCompressor(),
-		compressionType: constants.CompressionZlib,
+		secretKey:               keyBytes,
+		aesEncryptor:            encryption.NewAesEncryptor(),
+		sha512Hasher:            encryption.NewSha512Hasher(),
+		argon2Hasher:            encryption.NewArgon2Hasher(),
+		zlibCompressor:          compression.NewZlibCompressor(),
+		lzmaCompressor:          compression.NewLzmaCompressor(),
+		compressionType:         constants.CompressionZlib,
+		defaultCompressionLevel: constants.CompressionLevel,
 	}
+}
+
+func NewWithOptions(secretKey string, compressionLevel int) *K9Crypt {
+	k := New(secretKey)
+	if compressionLevel >= 0 && compressionLevel <= 9 {
+		k.defaultCompressionLevel = compressionLevel
+		k.zlibCompressor.SetLevel(compressionLevel)
+	}
+	return k
+}
+
+func (k *K9Crypt) SetCompressionLevel(level int) error {
+	if level < 0 || level > 9 {
+		return fmt.Errorf("compression level must be between 0 and 9")
+	}
+	k.defaultCompressionLevel = level
+	return k.zlibCompressor.SetLevel(level)
+}
+
+func (k *K9Crypt) GetCompressionLevel() int {
+	return k.defaultCompressionLevel
 }
 
 func (k *K9Crypt) Encrypt(plaintext string) (string, error) {
