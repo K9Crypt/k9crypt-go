@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"compress/flate"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"hash/adler32"
 	"hash/crc32"
@@ -24,7 +25,7 @@ func NewZlibCompressor() *ZlibCompressor {
 
 func (z *ZlibCompressor) Compress(data []byte) ([]byte, error) {
 	if len(data) == 0 {
-		return nil, fmt.Errorf("input data cannot be empty")
+		return nil, errors.New("compression error")
 	}
 
 	compressed := bytes.NewBuffer(make([]byte, 0, 131072))
@@ -34,18 +35,18 @@ func (z *ZlibCompressor) Compress(data []byte) ([]byte, error) {
 
 	deflateWriter, err := flate.NewWriter(compressed, z.level)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create deflate writer: %w", err)
+		return nil, errors.New("compression error")
 	}
 
 	_, err = deflateWriter.Write(data)
 	if err != nil {
 		deflateWriter.Close()
-		return nil, fmt.Errorf("failed to write compressed data: %w", err)
+		return nil, errors.New("compression error")
 	}
 
 	err = deflateWriter.Close()
 	if err != nil {
-		return nil, fmt.Errorf("failed to close deflate writer: %w", err)
+		return nil, errors.New("compression error")
 	}
 
 	checksum := adler32.Checksum(data)
@@ -58,11 +59,11 @@ func (z *ZlibCompressor) Compress(data []byte) ([]byte, error) {
 
 func (z *ZlibCompressor) Decompress(data []byte) ([]byte, error) {
 	if len(data) < 6 {
-		return nil, fmt.Errorf("invalid zlib data: too short")
+		return nil, errors.New("decompression error")
 	}
 
 	if data[0] != 0x78 {
-		return nil, fmt.Errorf("invalid zlib header")
+		return nil, errors.New("decompression error")
 	}
 
 	reader := bytes.NewReader(data[2 : len(data)-4])
@@ -72,19 +73,19 @@ func (z *ZlibCompressor) Decompress(data []byte) ([]byte, error) {
 	_, err := io.Copy(decompressed, deflateReader)
 	if err != nil {
 		deflateReader.Close()
-		return nil, fmt.Errorf("failed to decompress data: %w", err)
+		return nil, errors.New("decompression error")
 	}
 
 	err = deflateReader.Close()
 	if err != nil {
-		return nil, fmt.Errorf("failed to close deflate reader: %w", err)
+		return nil, errors.New("decompression error")
 	}
 
 	expectedChecksum := binary.BigEndian.Uint32(data[len(data)-4:])
 	actualChecksum := adler32.Checksum(decompressed.Bytes())
 
 	if expectedChecksum != actualChecksum {
-		return nil, fmt.Errorf("checksum verification failed")
+		return nil, errors.New("decompression error")
 	}
 
 	return decompressed.Bytes(), nil
@@ -92,15 +93,15 @@ func (z *ZlibCompressor) Decompress(data []byte) ([]byte, error) {
 
 func (z *ZlibCompressor) validateInput(data []byte) error {
 	if data == nil {
-		return fmt.Errorf("input data cannot be nil")
+		return errors.New("input data cannot be nil")
 	}
 
 	if len(data) == 0 {
-		return fmt.Errorf("input data cannot be empty")
+		return errors.New("input data cannot be empty")
 	}
 
 	if len(data) > 1024*1024*100 {
-		return fmt.Errorf("input data too large: maximum 100MB allowed")
+		return errors.New("input data too large")
 	}
 
 	return nil

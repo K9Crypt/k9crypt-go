@@ -5,13 +5,15 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/binary"
-	"fmt"
+	"errors"
+	"runtime"
 	"sync"
+
+	"github.com/K9Crypt/k9crypt-go/src/constants"
 )
 
 const (
-	ChunkSize        = 64 * 1024
-	DefaultBatchSize = 10
+	ChunkSize = 64 * 1024
 )
 
 type ProgressInfo struct {
@@ -49,9 +51,24 @@ type DecryptManyOptions struct {
 	OnProgress  func(BatchProgressInfo)
 }
 
+func defaultBatchSize() int {
+	n := runtime.NumCPU() * 2
+	if n < 1 {
+		return 1
+	}
+	if n > 32 {
+		return 32
+	}
+	return n
+}
+
 func (k *K9Crypt) EncryptFile(plaintext []byte, options *EncryptFileOptions) (string, error) {
 	if len(plaintext) == 0 {
-		return "", fmt.Errorf("input data cannot be empty")
+		return "", errors.New("stream encryption failed")
+	}
+
+	if len(plaintext) > constants.MaxPlaintextSize {
+		return "", errors.New("stream encryption failed")
 	}
 
 	if options == nil {
@@ -59,12 +76,12 @@ func (k *K9Crypt) EncryptFile(plaintext []byte, options *EncryptFileOptions) (st
 	}
 
 	if options.CompressionLevel < 0 || options.CompressionLevel > 9 {
-		options.CompressionLevel = 6
+		options.CompressionLevel = constants.CompressionLevel
 	}
 
 	err := k.zlibCompressor.SetLevel(options.CompressionLevel)
 	if err != nil {
-		return "", fmt.Errorf("failed to set compression level: %w", err)
+		return "", errors.New("stream encryption failed")
 	}
 
 	totalBytes := int64(len(plaintext))
@@ -80,7 +97,7 @@ func (k *K9Crypt) EncryptFile(plaintext []byte, options *EncryptFileOptions) (st
 		chunk := plaintext[i:end]
 		compressedChunk, err := k.compressData(chunk)
 		if err != nil {
-			return "", fmt.Errorf("compression failed at chunk %d: %w", i/ChunkSize, err)
+			return "", errors.New("stream encryption failed")
 		}
 
 		compressedChunks = append(compressedChunks, compressedChunk)
@@ -97,26 +114,26 @@ func (k *K9Crypt) EncryptFile(plaintext []byte, options *EncryptFileOptions) (st
 
 	salt, err := k.argon2Hasher.GenerateSalt()
 	if err != nil {
-		return "", fmt.Errorf("salt generation failed: %w", err)
+		return "", errors.New("stream encryption failed")
 	}
 
 	keys, err := k.deriveKeys(k.secretKey, salt)
 	if err != nil {
-		return "", fmt.Errorf("key derivation failed: %w", err)
+		return "", errors.New("stream encryption failed")
 	}
 
 	var encryptedChunks [][]byte
-	for i, chunk := range compressedChunks {
+	for _, chunk := range compressedChunks {
 		encryptedChunk, err := k.aesEncryptor.MultiLayerEncrypt(chunk, keys)
 		if err != nil {
-			return "", fmt.Errorf("encryption failed at chunk %d: %w", i, err)
+			return "", errors.New("stream encryption failed")
 		}
 		encryptedChunks = append(encryptedChunks, encryptedChunk)
 	}
 
 	hash, err := k.generateHash(plaintext, salt)
 	if err != nil {
-		return "", fmt.Errorf("hash generation failed: %w", err)
+		return "", errors.New("stream encryption failed")
 	}
 
 	buffer := bytes.NewBuffer(make([]byte, 0, 131072))
@@ -124,14 +141,14 @@ func (k *K9Crypt) EncryptFile(plaintext []byte, options *EncryptFileOptions) (st
 	paddingSizeByte := make([]byte, 1)
 	_, err = rand.Read(paddingSizeByte)
 	if err != nil {
-		return "", fmt.Errorf("failed to generate padding size: %w", err)
+		return "", errors.New("stream encryption failed")
 	}
 	paddingSize := byte(4 + int(paddingSizeByte[0])%13)
 	buffer.WriteByte(paddingSize)
 	padding := make([]byte, int(paddingSize))
 	_, err = rand.Read(padding)
 	if err != nil {
-		return "", fmt.Errorf("failed to generate padding: %w", err)
+		return "", errors.New("stream encryption failed")
 	}
 	buffer.Write(padding)
 
@@ -161,7 +178,7 @@ func (k *K9Crypt) EncryptFile(plaintext []byte, options *EncryptFileOptions) (st
 
 func (k *K9Crypt) DecryptFile(encryptedData string, options *DecryptFileOptions) ([]byte, error) {
 	if len(encryptedData) == 0 {
-		return nil, fmt.Errorf("encrypted data cannot be empty")
+		return nil, errors.New("stream decryption failed")
 	}
 
 	if options == nil {
@@ -170,11 +187,15 @@ func (k *K9Crypt) DecryptFile(encryptedData string, options *DecryptFileOptions)
 
 	decodedData, err := base64.StdEncoding.DecodeString(encryptedData)
 	if err != nil {
-		return nil, fmt.Errorf("invalid base64 data: %w", err)
+		return nil, errors.New("stream decryption failed")
 	}
 
-	if len(decodedData) < 17 {
-		return nil, fmt.Errorf("invalid encrypted data format")
+	if len(decodedData) > constants.MaxCiphertextSize {
+		return nil, errors.New("stream decryption failed")
+	}
+
+	if len(decodedData) < constants.MinPayloadSize {
+		return nil, errors.New("stream decryption failed")
 	}
 
 	reader := bytes.NewReader(decodedData)
@@ -182,45 +203,45 @@ func (k *K9Crypt) DecryptFile(encryptedData string, options *DecryptFileOptions)
 	paddingSizeByte := make([]byte, 1)
 	_, err = reader.Read(paddingSizeByte)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read padding size: %w", err)
+		return nil, errors.New("stream decryption failed")
 	}
 	paddingSize := int(paddingSizeByte[0])
 	padding := make([]byte, paddingSize)
 	_, err = reader.Read(padding)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read padding: %w", err)
+		return nil, errors.New("stream decryption failed")
 	}
 
 	saltLenBytes := make([]byte, 4)
 	_, err = reader.Read(saltLenBytes)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read salt length: %w", err)
+		return nil, errors.New("stream decryption failed")
 	}
 	saltLen := binary.LittleEndian.Uint32(saltLenBytes)
 
 	salt := make([]byte, saltLen)
 	_, err = reader.Read(salt)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read salt: %w", err)
+		return nil, errors.New("stream decryption failed")
 	}
 
 	hashLenBytes := make([]byte, 4)
 	_, err = reader.Read(hashLenBytes)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read hash length: %w", err)
+		return nil, errors.New("stream decryption failed")
 	}
 	hashLen := binary.LittleEndian.Uint32(hashLenBytes)
 
 	hash := make([]byte, hashLen)
 	_, err = reader.Read(hash)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read hash: %w", err)
+		return nil, errors.New("stream decryption failed")
 	}
 
 	chunkCountBytes := make([]byte, 4)
 	_, err = reader.Read(chunkCountBytes)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read chunk count: %w", err)
+		return nil, errors.New("stream decryption failed")
 	}
 	chunkCount := binary.LittleEndian.Uint32(chunkCountBytes)
 
@@ -229,21 +250,21 @@ func (k *K9Crypt) DecryptFile(encryptedData string, options *DecryptFileOptions)
 		chunkLenBytes := make([]byte, 4)
 		_, err = reader.Read(chunkLenBytes)
 		if err != nil {
-			return nil, fmt.Errorf("failed to read chunk length at chunk %d: %w", i, err)
+			return nil, errors.New("stream decryption failed")
 		}
 		chunkLen := binary.LittleEndian.Uint32(chunkLenBytes)
 
 		chunk := make([]byte, chunkLen)
 		_, err = reader.Read(chunk)
 		if err != nil {
-			return nil, fmt.Errorf("failed to read chunk at chunk %d: %w", i, err)
+			return nil, errors.New("stream decryption failed")
 		}
 		encryptedChunks = append(encryptedChunks, chunk)
 	}
 
 	keys, err := k.deriveKeys(k.secretKey, salt)
 	if err != nil {
-		return nil, fmt.Errorf("key derivation failed: %w", err)
+		return nil, errors.New("stream decryption failed")
 	}
 
 	var decryptedChunks [][]byte
@@ -251,12 +272,12 @@ func (k *K9Crypt) DecryptFile(encryptedData string, options *DecryptFileOptions)
 	for i, chunk := range encryptedChunks {
 		decryptedChunk, err := k.aesEncryptor.MultiLayerDecrypt(chunk, keys)
 		if err != nil {
-			return nil, fmt.Errorf("decryption failed at chunk %d: %w", i, err)
+			return nil, errors.New("stream decryption failed")
 		}
 
 		decompressedChunk, err := k.decompressData(decryptedChunk)
 		if err != nil {
-			return nil, fmt.Errorf("decompression failed at chunk %d: %w", i, err)
+			return nil, errors.New("stream decryption failed")
 		}
 
 		decryptedChunks = append(decryptedChunks, decompressedChunk)
@@ -278,7 +299,7 @@ func (k *K9Crypt) DecryptFile(encryptedData string, options *DecryptFileOptions)
 	plaintext := result.Bytes()
 
 	if !k.verifyHash(plaintext, salt, hash) {
-		return nil, fmt.Errorf("hash verification failed: data integrity compromised")
+		return nil, errors.New("stream decryption failed")
 	}
 
 	return plaintext, nil
@@ -286,7 +307,7 @@ func (k *K9Crypt) DecryptFile(encryptedData string, options *DecryptFileOptions)
 
 func (k *K9Crypt) EncryptMany(dataArray []string, options *EncryptManyOptions) ([]string, error) {
 	if len(dataArray) == 0 {
-		return nil, fmt.Errorf("data array cannot be empty")
+		return nil, errors.New("encryption failed")
 	}
 
 	if options == nil {
@@ -294,7 +315,14 @@ func (k *K9Crypt) EncryptMany(dataArray []string, options *EncryptManyOptions) (
 	}
 
 	if options.BatchSize <= 0 {
-		options.BatchSize = DefaultBatchSize
+		options.BatchSize = defaultBatchSize()
+	}
+
+	for i, data := range dataArray {
+		if len(data) > constants.MaxPlaintextSize {
+			return nil, errors.New("encryption failed")
+		}
+		_ = i
 	}
 
 	if options.Parallel {
@@ -316,7 +344,7 @@ func (k *K9Crypt) encryptManySequential(dataArray []string, options *EncryptMany
 
 		encrypted, err := k.Encrypt(data)
 		if err != nil {
-			return nil, fmt.Errorf("encryption failed at index %d: %w", i, err)
+			return nil, errors.New("encryption failed")
 		}
 
 		results[i] = encrypted
@@ -335,38 +363,42 @@ func (k *K9Crypt) encryptManySequential(dataArray []string, options *EncryptMany
 
 func (k *K9Crypt) encryptManyParallel(dataArray []string, options *EncryptManyOptions) ([]string, error) {
 	results := make([]string, len(dataArray))
-	errors := make([]error, len(dataArray))
+	batchSize := options.BatchSize
 
-	var wg sync.WaitGroup
-	semaphore := make(chan struct{}, options.BatchSize)
-
-	for i, data := range dataArray {
-		if data == "" {
-			results[i] = ""
-			continue
+	for i := 0; i < len(dataArray); i += batchSize {
+		end := i + batchSize
+		if end > len(dataArray) {
+			end = len(dataArray)
 		}
 
-		wg.Add(1)
-		semaphore <- struct{}{}
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+		var batchErr error
 
-		go func(index int, plaintext string) {
-			defer wg.Done()
-			defer func() { <-semaphore }()
-
-			encrypted, err := k.Encrypt(plaintext)
-			if err != nil {
-				errors[index] = err
-				return
+		for j := i; j < end; j++ {
+			if dataArray[j] == "" {
+				continue
 			}
-			results[index] = encrypted
-		}(i, data)
-	}
 
-	wg.Wait()
+			wg.Add(1)
+			go func(index int, plaintext string) {
+				defer wg.Done()
 
-	for i, err := range errors {
-		if err != nil {
-			return nil, fmt.Errorf("encryption failed at index %d: %w", i, err)
+				encrypted, err := k.Encrypt(plaintext)
+				if err != nil {
+					mu.Lock()
+					batchErr = errors.New("encryption failed")
+					mu.Unlock()
+					return
+				}
+				results[index] = encrypted
+			}(j, dataArray[j])
+		}
+
+		wg.Wait()
+
+		if batchErr != nil {
+			return nil, batchErr
 		}
 	}
 
@@ -375,7 +407,7 @@ func (k *K9Crypt) encryptManyParallel(dataArray []string, options *EncryptManyOp
 
 func (k *K9Crypt) DecryptMany(ciphertextArray []string, options *DecryptManyOptions) ([]string, error) {
 	if len(ciphertextArray) == 0 {
-		return nil, fmt.Errorf("ciphertext array cannot be empty")
+		return nil, errors.New("decryption failed")
 	}
 
 	if options == nil {
@@ -383,7 +415,23 @@ func (k *K9Crypt) DecryptMany(ciphertextArray []string, options *DecryptManyOpti
 	}
 
 	if options.BatchSize <= 0 {
-		options.BatchSize = DefaultBatchSize
+		options.BatchSize = defaultBatchSize()
+	}
+
+	for i, data := range ciphertextArray {
+		if data == "" {
+			continue
+		}
+		if len(data) > constants.MaxCiphertextSize {
+			return nil, errors.New("decryption failed")
+		}
+		if len(data) < constants.MinPayloadSize {
+			if options.SkipInvalid {
+				continue
+			}
+			return nil, errors.New("decryption failed")
+		}
+		_ = i
 	}
 
 	if options.Parallel {
@@ -409,7 +457,7 @@ func (k *K9Crypt) decryptManySequential(ciphertextArray []string, options *Decry
 				results[i] = ""
 				continue
 			}
-			return nil, fmt.Errorf("decryption failed at index %d: %w", i, err)
+			return nil, errors.New("decryption failed")
 		}
 
 		results[i] = decrypted
@@ -428,42 +476,46 @@ func (k *K9Crypt) decryptManySequential(ciphertextArray []string, options *Decry
 
 func (k *K9Crypt) decryptManyParallel(ciphertextArray []string, options *DecryptManyOptions) ([]string, error) {
 	results := make([]string, len(ciphertextArray))
-	errors := make([]error, len(ciphertextArray))
+	batchSize := options.BatchSize
 
-	var wg sync.WaitGroup
-	semaphore := make(chan struct{}, options.BatchSize)
-
-	for i, ciphertext := range ciphertextArray {
-		if ciphertext == "" {
-			results[i] = ""
-			continue
+	for i := 0; i < len(ciphertextArray); i += batchSize {
+		end := i + batchSize
+		if end > len(ciphertextArray) {
+			end = len(ciphertextArray)
 		}
 
-		wg.Add(1)
-		semaphore <- struct{}{}
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+		var batchErr error
 
-		go func(index int, encrypted string) {
-			defer wg.Done()
-			defer func() { <-semaphore }()
+		for j := i; j < end; j++ {
+			if ciphertextArray[j] == "" {
+				continue
+			}
 
-			decrypted, err := k.Decrypt(encrypted)
-			if err != nil {
-				if options.SkipInvalid {
-					results[index] = ""
+			wg.Add(1)
+			go func(index int, encrypted string) {
+				defer wg.Done()
+
+				decrypted, err := k.Decrypt(encrypted)
+				if err != nil {
+					if options.SkipInvalid {
+						results[index] = ""
+						return
+					}
+					mu.Lock()
+					batchErr = errors.New("decryption failed")
+					mu.Unlock()
 					return
 				}
-				errors[index] = err
-				return
-			}
-			results[index] = decrypted
-		}(i, ciphertext)
-	}
+				results[index] = decrypted
+			}(j, ciphertextArray[j])
+		}
 
-	wg.Wait()
+		wg.Wait()
 
-	for i, err := range errors {
-		if err != nil {
-			return nil, fmt.Errorf("decryption failed at index %d: %w", i, err)
+		if batchErr != nil {
+			return nil, batchErr
 		}
 	}
 

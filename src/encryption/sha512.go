@@ -3,13 +3,15 @@ package encryption
 import (
 	"crypto/hmac"
 	"crypto/sha512"
-	"fmt"
+	"crypto/subtle"
+	"errors"
+
 	"github.com/K9Crypt/k9crypt-go/src/constants"
 )
 
 type Sha512Hasher struct {
-	pepper string
-	hmacKey string
+	pepper  []byte
+	hmacKey []byte
 }
 
 func NewSha512Hasher() *Sha512Hasher {
@@ -21,76 +23,76 @@ func NewSha512Hasher() *Sha512Hasher {
 
 func (s *Sha512Hasher) Hash(data []byte) ([]byte, error) {
 	if len(data) == 0 {
-		return nil, fmt.Errorf("input data cannot be empty")
+		return nil, errors.New("hashing failed")
 	}
 
 	hasher := sha512.New()
 	hasher.Write(data)
-	hasher.Write([]byte(s.pepper))
+	hasher.Write(s.pepper)
 
 	return hasher.Sum(nil), nil
 }
 
 func (s *Sha512Hasher) HashWithSalt(data []byte, salt []byte) ([]byte, error) {
 	if len(data) == 0 {
-		return nil, fmt.Errorf("input data cannot be empty")
+		return nil, errors.New("hashing failed")
 	}
 
 	if len(salt) == 0 {
-		return nil, fmt.Errorf("salt cannot be empty")
+		return nil, errors.New("hashing failed")
 	}
 
 	hasher := sha512.New()
 	hasher.Write(salt)
 	hasher.Write(data)
-	hasher.Write([]byte(s.pepper))
+	hasher.Write(s.pepper)
 
 	return hasher.Sum(nil), nil
 }
 
 func (s *Sha512Hasher) HmacHash(data []byte) ([]byte, error) {
 	if len(data) == 0 {
-		return nil, fmt.Errorf("input data cannot be empty")
+		return nil, errors.New("hashing failed")
 	}
 
-	h := hmac.New(sha512.New, []byte(s.hmacKey))
+	h := hmac.New(sha512.New, s.hmacKey)
 	h.Write(data)
-	h.Write([]byte(s.pepper))
+	h.Write(s.pepper)
 
 	return h.Sum(nil), nil
 }
 
 func (s *Sha512Hasher) HmacHashWithSalt(data []byte, salt []byte) ([]byte, error) {
 	if len(data) == 0 {
-		return nil, fmt.Errorf("input data cannot be empty")
+		return nil, errors.New("hashing failed")
 	}
 
 	if len(salt) == 0 {
-		return nil, fmt.Errorf("salt cannot be empty")
+		return nil, errors.New("hashing failed")
 	}
 
-	h := hmac.New(sha512.New, []byte(s.hmacKey))
+	h := hmac.New(sha512.New, s.hmacKey)
 	h.Write(salt)
 	h.Write(data)
-	h.Write([]byte(s.pepper))
+	h.Write(s.pepper)
 
 	return h.Sum(nil), nil
 }
 
 func (s *Sha512Hasher) MultiRoundHash(data []byte, rounds int) ([]byte, error) {
 	if len(data) == 0 {
-		return nil, fmt.Errorf("input data cannot be empty")
+		return nil, errors.New("hashing failed")
 	}
 
 	if rounds <= 0 {
-		return nil, fmt.Errorf("rounds must be positive")
+		return nil, errors.New("hashing failed")
 	}
 
 	result := data
 	for i := 0; i < rounds; i++ {
 		hash, err := s.Hash(result)
 		if err != nil {
-			return nil, fmt.Errorf("failed at round %d: %w", i+1, err)
+			return nil, errors.New("hashing failed")
 		}
 		result = hash
 	}
@@ -100,22 +102,22 @@ func (s *Sha512Hasher) MultiRoundHash(data []byte, rounds int) ([]byte, error) {
 
 func (s *Sha512Hasher) MultiRoundHashWithSalt(data []byte, salt []byte, rounds int) ([]byte, error) {
 	if len(data) == 0 {
-		return nil, fmt.Errorf("input data cannot be empty")
+		return nil, errors.New("hashing failed")
 	}
 
 	if len(salt) == 0 {
-		return nil, fmt.Errorf("salt cannot be empty")
+		return nil, errors.New("hashing failed")
 	}
 
 	if rounds <= 0 {
-		return nil, fmt.Errorf("rounds must be positive")
+		return nil, errors.New("hashing failed")
 	}
 
 	result := data
 	for i := 0; i < rounds; i++ {
 		hash, err := s.HashWithSalt(result, salt)
 		if err != nil {
-			return nil, fmt.Errorf("failed at round %d: %w", i+1, err)
+			return nil, errors.New("hashing failed")
 		}
 		result = hash
 	}
@@ -137,13 +139,7 @@ func (s *Sha512Hasher) Verify(data []byte, hash []byte) bool {
 		return false
 	}
 
-	for i := 0; i < len(computedHash); i++ {
-		if computedHash[i] != hash[i] {
-			return false
-		}
-	}
-
-	return true
+	return subtle.ConstantTimeCompare(computedHash, hash) == 1
 }
 
 func (s *Sha512Hasher) VerifyWithSalt(data []byte, salt []byte, hash []byte) bool {
@@ -160,13 +156,7 @@ func (s *Sha512Hasher) VerifyWithSalt(data []byte, salt []byte, hash []byte) boo
 		return false
 	}
 
-	for i := 0; i < len(computedHash); i++ {
-		if computedHash[i] != hash[i] {
-			return false
-		}
-	}
-
-	return true
+	return subtle.ConstantTimeCompare(computedHash, hash) == 1
 }
 
 func (s *Sha512Hasher) HmacVerify(data []byte, hash []byte) bool {
@@ -197,15 +187,15 @@ func (s *Sha512Hasher) HmacVerifyWithSalt(data []byte, salt []byte, hash []byte)
 
 func (s *Sha512Hasher) validateInput(data []byte) error {
 	if data == nil {
-		return fmt.Errorf("input data cannot be nil")
+		return errors.New("input data cannot be nil")
 	}
 
 	if len(data) == 0 {
-		return fmt.Errorf("input data cannot be empty")
+		return errors.New("input data cannot be empty")
 	}
 
 	if len(data) > 1024*1024*10 {
-		return fmt.Errorf("input data too large: maximum 10MB allowed")
+		return errors.New("input data too large")
 	}
 
 	return nil
@@ -227,7 +217,7 @@ func (s *Sha512Hasher) HashWithSaltValidation(data []byte, salt []byte) ([]byte,
 	}
 
 	if len(salt) == 0 {
-		return nil, fmt.Errorf("salt cannot be empty")
+		return nil, errors.New("salt cannot be empty")
 	}
 
 	return s.HashWithSalt(data, salt)

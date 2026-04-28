@@ -4,7 +4,9 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
+	"errors"
 	"fmt"
+
 	"github.com/K9Crypt/k9crypt-go/src/constants"
 )
 
@@ -28,7 +30,7 @@ func (a *AesEncryptor) GenerateKey() ([]byte, error) {
 	key := make([]byte, constants.KeySize)
 	_, err := rand.Read(key)
 	if err != nil {
-		return nil, fmt.Errorf("failed to generate key: %w", err)
+		return nil, errors.New("key generation failed")
 	}
 	return key, nil
 }
@@ -37,25 +39,50 @@ func (a *AesEncryptor) GenerateIv() ([]byte, error) {
 	iv := make([]byte, constants.IvSize)
 	_, err := rand.Read(iv)
 	if err != nil {
-		return nil, fmt.Errorf("failed to generate IV: %w", err)
+		return nil, errors.New("IV generation failed")
 	}
 	return iv, nil
 }
 
+func (a *AesEncryptor) generateIvs(count int) ([][]byte, error) {
+	if count <= 0 {
+		return nil, errors.New("invalid IV count")
+	}
+
+	totalBytes := count * constants.IvSize
+	raw := make([]byte, totalBytes)
+	_, err := rand.Read(raw)
+	if err != nil {
+		return nil, errors.New("IV generation failed")
+	}
+
+	ivs := make([][]byte, count)
+	for i := 0; i < count; i++ {
+		ivs[i] = raw[i*constants.IvSize : (i+1)*constants.IvSize]
+	}
+
+	return ivs, nil
+}
+
 func (a *AesEncryptor) MultiLayerEncrypt(data []byte, keys [][]byte) ([]byte, error) {
 	if len(data) == 0 {
-		return nil, fmt.Errorf("input data cannot be empty")
+		return nil, errors.New("encryption failed")
 	}
 
 	if len(keys) != len(a.modes) {
-		return nil, fmt.Errorf("number of keys must match number of modes")
+		return nil, errors.New("encryption failed")
+	}
+
+	ivs, err := a.generateIvs(len(a.modes))
+	if err != nil {
+		return nil, errors.New("encryption failed")
 	}
 
 	result := data
 	for i, mode := range a.modes {
-		encrypted, err := a.encryptWithMode(result, keys[i], mode)
+		encrypted, err := a.encryptWithMode(result, keys[i], mode, ivs[i])
 		if err != nil {
-			return nil, fmt.Errorf("failed at layer %d (%s): %w", i+1, mode, err)
+			return nil, errors.New("encryption failed")
 		}
 		result = encrypted
 	}
@@ -65,18 +92,18 @@ func (a *AesEncryptor) MultiLayerEncrypt(data []byte, keys [][]byte) ([]byte, er
 
 func (a *AesEncryptor) MultiLayerDecrypt(data []byte, keys [][]byte) ([]byte, error) {
 	if len(data) == 0 {
-		return nil, fmt.Errorf("input data cannot be empty")
+		return nil, errors.New("decryption failed")
 	}
 
 	if len(keys) != len(a.modes) {
-		return nil, fmt.Errorf("number of keys must match number of modes")
+		return nil, errors.New("decryption failed")
 	}
 
 	result := data
 	for i := len(a.modes) - 1; i >= 0; i-- {
 		decrypted, err := a.decryptWithMode(result, keys[i], a.modes[i])
 		if err != nil {
-			return nil, fmt.Errorf("failed at layer %d (%s): %w", len(a.modes)-i, a.modes[i], err)
+			return nil, errors.New("decryption failed")
 		}
 		result = decrypted
 	}
@@ -84,43 +111,43 @@ func (a *AesEncryptor) MultiLayerDecrypt(data []byte, keys [][]byte) ([]byte, er
 	return result, nil
 }
 
-func (a *AesEncryptor) encryptWithMode(data []byte, key []byte, mode constants.AesMode) ([]byte, error) {
+func (a *AesEncryptor) encryptWithMode(data []byte, key []byte, mode constants.AesMode, iv []byte) ([]byte, error) {
 	if len(key) != constants.KeySize {
-		return nil, fmt.Errorf("invalid key size: expected %d, got %d", constants.KeySize, len(key))
+		return nil, errors.New("encryption failed")
 	}
 
 	block, err := aes.NewCipher(key)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create cipher: %w", err)
+		return nil, errors.New("encryption failed")
 	}
 
 	if mode == constants.AesGcm {
 		return a.encryptGcm(data, block)
 	}
 	if mode == constants.AesCbc {
-		return a.encryptCbc(data, block)
+		return a.encryptCbc(data, block, iv)
 	}
 	if mode == constants.AesCfb {
-		return a.encryptCfb(data, block)
+		return a.encryptCfb(data, block, iv)
 	}
 	if mode == constants.AesOfb {
-		return a.encryptOfb(data, block)
+		return a.encryptOfb(data, block, iv)
 	}
 	if mode == constants.AesCtr {
-		return a.encryptCtr(data, block)
+		return a.encryptCtr(data, block, iv)
 	}
 
-	return nil, fmt.Errorf("unsupported encryption mode: %s", mode)
+	return nil, errors.New("encryption failed")
 }
 
 func (a *AesEncryptor) decryptWithMode(data []byte, key []byte, mode constants.AesMode) ([]byte, error) {
 	if len(key) != constants.KeySize {
-		return nil, fmt.Errorf("invalid key size: expected %d, got %d", constants.KeySize, len(key))
+		return nil, errors.New("decryption failed")
 	}
 
 	block, err := aes.NewCipher(key)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create cipher: %w", err)
+		return nil, errors.New("decryption failed")
 	}
 
 	if mode == constants.AesGcm {
@@ -139,19 +166,19 @@ func (a *AesEncryptor) decryptWithMode(data []byte, key []byte, mode constants.A
 		return a.decryptCtr(data, block)
 	}
 
-	return nil, fmt.Errorf("unsupported decryption mode: %s", mode)
+	return nil, errors.New("decryption failed")
 }
 
 func (a *AesEncryptor) encryptGcm(data []byte, block cipher.Block) ([]byte, error) {
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create GCM: %w", err)
+		return nil, errors.New("encryption failed")
 	}
 
 	nonce := make([]byte, gcm.NonceSize())
 	_, err = rand.Read(nonce)
 	if err != nil {
-		return nil, fmt.Errorf("failed to generate nonce: %w", err)
+		return nil, errors.New("encryption failed")
 	}
 
 	ciphertext := gcm.Seal(nonce, nonce, data, nil)
@@ -161,12 +188,12 @@ func (a *AesEncryptor) encryptGcm(data []byte, block cipher.Block) ([]byte, erro
 func (a *AesEncryptor) decryptGcm(data []byte, block cipher.Block) ([]byte, error) {
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create GCM: %w", err)
+		return nil, errors.New("decryption failed")
 	}
 
 	nonceSize := gcm.NonceSize()
 	if len(data) < nonceSize {
-		return nil, fmt.Errorf("invalid ciphertext: too short")
+		return nil, errors.New("decryption failed")
 	}
 
 	nonce := data[:nonceSize]
@@ -174,20 +201,15 @@ func (a *AesEncryptor) decryptGcm(data []byte, block cipher.Block) ([]byte, erro
 
 	plaintext, err := gcm.Open(nil, nonce, ciphertext, nil)
 	if err != nil {
-		return nil, fmt.Errorf("failed to decrypt: %w", err)
+		return nil, errors.New("decryption failed")
 	}
 
 	return plaintext, nil
 }
 
-func (a *AesEncryptor) encryptCbc(data []byte, block cipher.Block) ([]byte, error) {
+func (a *AesEncryptor) encryptCbc(data []byte, block cipher.Block, iv []byte) ([]byte, error) {
 	blockSize := block.BlockSize()
 	data = a.pkcs7Pad(data, blockSize)
-
-	iv, err := a.GenerateIv()
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate IV: %w", err)
-	}
 
 	mode := cipher.NewCBCEncrypter(block, iv)
 	ciphertext := make([]byte, len(data))
@@ -203,14 +225,14 @@ func (a *AesEncryptor) encryptCbc(data []byte, block cipher.Block) ([]byte, erro
 func (a *AesEncryptor) decryptCbc(data []byte, block cipher.Block) ([]byte, error) {
 	blockSize := block.BlockSize()
 	if len(data) < blockSize {
-		return nil, fmt.Errorf("invalid ciphertext: too short")
+		return nil, errors.New("decryption failed")
 	}
 
 	iv := data[:blockSize]
 	ciphertext := data[blockSize:]
 
 	if len(ciphertext)%blockSize != 0 {
-		return nil, fmt.Errorf("invalid ciphertext: not multiple of block size")
+		return nil, errors.New("decryption failed")
 	}
 
 	mode := cipher.NewCBCDecrypter(block, iv)
@@ -220,12 +242,7 @@ func (a *AesEncryptor) decryptCbc(data []byte, block cipher.Block) ([]byte, erro
 	return a.pkcs7Unpad(plaintext)
 }
 
-func (a *AesEncryptor) encryptCfb(data []byte, block cipher.Block) ([]byte, error) {
-	iv, err := a.GenerateIv()
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate IV: %w", err)
-	}
-
+func (a *AesEncryptor) encryptCfb(data []byte, block cipher.Block, iv []byte) ([]byte, error) {
 	stream := cipher.NewCFBEncrypter(block, iv)
 	ciphertext := make([]byte, len(data))
 	stream.XORKeyStream(ciphertext, data)
@@ -240,7 +257,7 @@ func (a *AesEncryptor) encryptCfb(data []byte, block cipher.Block) ([]byte, erro
 func (a *AesEncryptor) decryptCfb(data []byte, block cipher.Block) ([]byte, error) {
 	blockSize := block.BlockSize()
 	if len(data) < blockSize {
-		return nil, fmt.Errorf("invalid ciphertext: too short")
+		return nil, errors.New("decryption failed")
 	}
 
 	iv := data[:blockSize]
@@ -253,12 +270,7 @@ func (a *AesEncryptor) decryptCfb(data []byte, block cipher.Block) ([]byte, erro
 	return plaintext, nil
 }
 
-func (a *AesEncryptor) encryptOfb(data []byte, block cipher.Block) ([]byte, error) {
-	iv, err := a.GenerateIv()
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate IV: %w", err)
-	}
-
+func (a *AesEncryptor) encryptOfb(data []byte, block cipher.Block, iv []byte) ([]byte, error) {
 	stream := cipher.NewOFB(block, iv)
 	ciphertext := make([]byte, len(data))
 	stream.XORKeyStream(ciphertext, data)
@@ -273,7 +285,7 @@ func (a *AesEncryptor) encryptOfb(data []byte, block cipher.Block) ([]byte, erro
 func (a *AesEncryptor) decryptOfb(data []byte, block cipher.Block) ([]byte, error) {
 	blockSize := block.BlockSize()
 	if len(data) < blockSize {
-		return nil, fmt.Errorf("invalid ciphertext: too short")
+		return nil, errors.New("decryption failed")
 	}
 
 	iv := data[:blockSize]
@@ -286,12 +298,7 @@ func (a *AesEncryptor) decryptOfb(data []byte, block cipher.Block) ([]byte, erro
 	return plaintext, nil
 }
 
-func (a *AesEncryptor) encryptCtr(data []byte, block cipher.Block) ([]byte, error) {
-	iv, err := a.GenerateIv()
-	if err != nil {
-		return nil, fmt.Errorf("failed to generate IV: %w", err)
-	}
-
+func (a *AesEncryptor) encryptCtr(data []byte, block cipher.Block, iv []byte) ([]byte, error) {
 	stream := cipher.NewCTR(block, iv)
 	ciphertext := make([]byte, len(data))
 	stream.XORKeyStream(ciphertext, data)
@@ -306,7 +313,7 @@ func (a *AesEncryptor) encryptCtr(data []byte, block cipher.Block) ([]byte, erro
 func (a *AesEncryptor) decryptCtr(data []byte, block cipher.Block) ([]byte, error) {
 	blockSize := block.BlockSize()
 	if len(data) < blockSize {
-		return nil, fmt.Errorf("invalid ciphertext: too short")
+		return nil, errors.New("decryption failed")
 	}
 
 	iv := data[:blockSize]
@@ -330,17 +337,17 @@ func (a *AesEncryptor) pkcs7Pad(data []byte, blockSize int) []byte {
 
 func (a *AesEncryptor) pkcs7Unpad(data []byte) ([]byte, error) {
 	if len(data) == 0 {
-		return nil, fmt.Errorf("invalid padding: empty data")
+		return nil, errors.New("decryption failed")
 	}
 
 	padding := int(data[len(data)-1])
 	if padding > len(data) || padding == 0 {
-		return nil, fmt.Errorf("invalid padding")
+		return nil, errors.New("decryption failed")
 	}
 
 	for i := len(data) - padding; i < len(data); i++ {
 		if data[i] != byte(padding) {
-			return nil, fmt.Errorf("invalid padding")
+			return nil, errors.New("decryption failed")
 		}
 	}
 
@@ -349,14 +356,14 @@ func (a *AesEncryptor) pkcs7Unpad(data []byte) ([]byte, error) {
 
 func (a *AesEncryptor) GenerateKeys(count int) ([][]byte, error) {
 	if count <= 0 {
-		return nil, fmt.Errorf("count must be positive")
+		return nil, errors.New("invalid key count")
 	}
 
 	keys := make([][]byte, count)
 	for i := 0; i < count; i++ {
 		key, err := a.GenerateKey()
 		if err != nil {
-			return nil, fmt.Errorf("failed to generate key %d: %w", i+1, err)
+			return nil, errors.New("key generation failed")
 		}
 		keys[i] = key
 	}
@@ -366,15 +373,15 @@ func (a *AesEncryptor) GenerateKeys(count int) ([][]byte, error) {
 
 func (a *AesEncryptor) validateInput(data []byte) error {
 	if data == nil {
-		return fmt.Errorf("input data cannot be nil")
+		return errors.New("input data cannot be nil")
 	}
 
 	if len(data) == 0 {
-		return fmt.Errorf("input data cannot be empty")
+		return errors.New("input data cannot be empty")
 	}
 
 	if len(data) > 1024*1024*50 {
-		return fmt.Errorf("input data too large: maximum 50MB allowed")
+		return errors.New("input data too large")
 	}
 
 	return nil
@@ -404,12 +411,12 @@ func (a *AesEncryptor) GetModes() []constants.AesMode {
 
 func (a *AesEncryptor) SetModes(modes []constants.AesMode) error {
 	if len(modes) == 0 {
-		return fmt.Errorf("modes cannot be empty")
+		return errors.New("modes cannot be empty")
 	}
 
 	for _, mode := range modes {
 		if mode != constants.AesGcm && mode != constants.AesCbc &&
-		   mode != constants.AesCfb && mode != constants.AesOfb && mode != constants.AesCtr {
+			mode != constants.AesCfb && mode != constants.AesOfb && mode != constants.AesCtr {
 			return fmt.Errorf("unsupported mode: %s", mode)
 		}
 	}

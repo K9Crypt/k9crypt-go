@@ -3,7 +3,7 @@ package compression
 import (
 	"bytes"
 	"encoding/binary"
-	"fmt"
+	"errors"
 	"io"
 )
 
@@ -23,19 +23,19 @@ func NewLzmaCompressor() *LzmaCompressor {
 
 func (lzma *LzmaCompressor) Compress(data []byte) ([]byte, error) {
 	if len(data) == 0 {
-		return nil, fmt.Errorf("input data cannot be empty")
+		return nil, errors.New("compression error")
 	}
 
 	result := bytes.NewBuffer(make([]byte, 0, 131072))
 
 	err := lzma.writeHeader(result, len(data))
 	if err != nil {
-		return nil, fmt.Errorf("failed to write header: %w", err)
+		return nil, errors.New("compression error")
 	}
 
 	compressed, err := lzma.simpleCompress(data)
 	if err != nil {
-		return nil, fmt.Errorf("failed to compress data: %w", err)
+		return nil, errors.New("compression error")
 	}
 
 	result.Write(compressed)
@@ -44,25 +44,25 @@ func (lzma *LzmaCompressor) Compress(data []byte) ([]byte, error) {
 
 func (lzma *LzmaCompressor) Decompress(data []byte) ([]byte, error) {
 	if len(data) < 13 {
-		return nil, fmt.Errorf("invalid LZMA data: too short")
+		return nil, errors.New("decompression error")
 	}
 
 	reader := bytes.NewReader(data)
 
 	originalSize, err := lzma.readHeader(reader)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read header: %w", err)
+		return nil, errors.New("decompression error")
 	}
 
 	remaining := make([]byte, len(data)-13)
 	_, err = reader.Read(remaining)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read compressed data: %w", err)
+		return nil, errors.New("decompression error")
 	}
 
 	decompressed, err := lzma.simpleDecompress(remaining, originalSize)
 	if err != nil {
-		return nil, fmt.Errorf("failed to decompress data: %w", err)
+		return nil, errors.New("decompression error")
 	}
 
 	return decompressed, nil
@@ -280,15 +280,15 @@ func (lzma *LzmaCompressor) computeHash(data []byte, pos int) uint32 {
 
 func (lzma *LzmaCompressor) validateInput(data []byte) error {
 	if data == nil {
-		return fmt.Errorf("input data cannot be nil")
+		return errors.New("input data cannot be nil")
 	}
 
 	if len(data) == 0 {
-		return fmt.Errorf("input data cannot be empty")
+		return errors.New("input data cannot be empty")
 	}
 
 	if len(data) > 1024*1024*100 {
-		return fmt.Errorf("input data too large: maximum 100MB allowed")
+		return errors.New("input data too large")
 	}
 
 	return nil

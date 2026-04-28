@@ -2,6 +2,8 @@ package encryption
 
 import (
 	"crypto/rand"
+	"crypto/subtle"
+	"errors"
 	"fmt"
 
 	"github.com/K9Crypt/k9crypt-go/src/constants"
@@ -19,9 +21,9 @@ type Argon2Hasher struct {
 
 func NewArgon2Hasher() *Argon2Hasher {
 	return &Argon2Hasher{
-		time:    1,
-		memory:  16 * 1024,
-		threads: 1,
+		time:    constants.Argon2Time,
+		memory:  constants.Argon2Memory,
+		threads: constants.Argon2Threads,
 		saltLen: constants.Argon2SaltSize,
 		keyLen:  constants.Argon2HashLength,
 	}
@@ -31,18 +33,18 @@ func (a *Argon2Hasher) GenerateSalt() ([]byte, error) {
 	salt := make([]byte, a.saltLen)
 	_, err := rand.Read(salt)
 	if err != nil {
-		return nil, fmt.Errorf("failed to generate salt: %w", err)
+		return nil, fmt.Errorf("salt generation failed")
 	}
 	return salt, nil
 }
 
 func (a *Argon2Hasher) Hash(password []byte, salt []byte) ([]byte, error) {
 	if len(password) == 0 {
-		return nil, fmt.Errorf("password cannot be empty")
+		return nil, errors.New("hashing failed")
 	}
 
 	if len(salt) == 0 {
-		return nil, fmt.Errorf("salt cannot be empty")
+		return nil, errors.New("hashing failed")
 	}
 
 	hash := argon2.IDKey(password, salt, a.time, a.memory, a.threads, uint32(a.keyLen))
@@ -51,17 +53,17 @@ func (a *Argon2Hasher) Hash(password []byte, salt []byte) ([]byte, error) {
 
 func (a *Argon2Hasher) HashWithGeneratedSalt(password []byte) ([]byte, []byte, error) {
 	if len(password) == 0 {
-		return nil, nil, fmt.Errorf("password cannot be empty")
+		return nil, nil, errors.New("hashing failed")
 	}
 
 	salt, err := a.GenerateSalt()
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to generate salt: %w", err)
+		return nil, nil, errors.New("hashing failed")
 	}
 
 	hash, err := a.Hash(password, salt)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to hash password: %w", err)
+		return nil, nil, errors.New("hashing failed")
 	}
 
 	return hash, salt, nil
@@ -81,26 +83,20 @@ func (a *Argon2Hasher) Verify(password []byte, salt []byte, hash []byte) bool {
 		return false
 	}
 
-	for i := 0; i < len(computedHash); i++ {
-		if computedHash[i] != hash[i] {
-			return false
-		}
-	}
-
-	return true
+	return subtle.ConstantTimeCompare(computedHash, hash) == 1
 }
 
 func (a *Argon2Hasher) DeriveKey(password []byte, salt []byte, keyLength uint32) ([]byte, error) {
 	if len(password) == 0 {
-		return nil, fmt.Errorf("password cannot be empty")
+		return nil, errors.New("key derivation failed")
 	}
 
 	if len(salt) == 0 {
-		return nil, fmt.Errorf("salt cannot be empty")
+		return nil, errors.New("key derivation failed")
 	}
 
 	if keyLength == 0 {
-		return nil, fmt.Errorf("key length must be positive")
+		return nil, errors.New("key derivation failed")
 	}
 
 	key := argon2.IDKey(password, salt, a.time, a.memory, a.threads, keyLength)
@@ -109,21 +105,21 @@ func (a *Argon2Hasher) DeriveKey(password []byte, salt []byte, keyLength uint32)
 
 func (a *Argon2Hasher) DeriveKeyWithGeneratedSalt(password []byte, keyLength uint32) ([]byte, []byte, error) {
 	if len(password) == 0 {
-		return nil, nil, fmt.Errorf("password cannot be empty")
+		return nil, nil, errors.New("key derivation failed")
 	}
 
 	if keyLength == 0 {
-		return nil, nil, fmt.Errorf("key length must be positive")
+		return nil, nil, errors.New("key derivation failed")
 	}
 
 	salt, err := a.GenerateSalt()
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to generate salt: %w", err)
+		return nil, nil, errors.New("key derivation failed")
 	}
 
 	key, err := a.DeriveKey(password, salt, keyLength)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to derive key: %w", err)
+		return nil, nil, errors.New("key derivation failed")
 	}
 
 	return key, salt, nil
@@ -131,22 +127,22 @@ func (a *Argon2Hasher) DeriveKeyWithGeneratedSalt(password []byte, keyLength uin
 
 func (a *Argon2Hasher) MultiRoundHash(password []byte, salt []byte, rounds int) ([]byte, error) {
 	if len(password) == 0 {
-		return nil, fmt.Errorf("password cannot be empty")
+		return nil, errors.New("hashing failed")
 	}
 
 	if len(salt) == 0 {
-		return nil, fmt.Errorf("salt cannot be empty")
+		return nil, errors.New("hashing failed")
 	}
 
 	if rounds <= 0 {
-		return nil, fmt.Errorf("rounds must be positive")
+		return nil, errors.New("hashing failed")
 	}
 
 	result := password
 	for i := 0; i < rounds; i++ {
 		hash, err := a.Hash(result, salt)
 		if err != nil {
-			return nil, fmt.Errorf("failed at round %d: %w", i+1, err)
+			return nil, errors.New("hashing failed")
 		}
 		result = hash
 	}
@@ -156,15 +152,15 @@ func (a *Argon2Hasher) MultiRoundHash(password []byte, salt []byte, rounds int) 
 
 func (a *Argon2Hasher) SetParameters(time uint32, memory uint32, threads uint8) error {
 	if time == 0 {
-		return fmt.Errorf("time parameter must be positive")
+		return errors.New("invalid time parameter")
 	}
 
 	if memory == 0 {
-		return fmt.Errorf("memory parameter must be positive")
+		return errors.New("invalid memory parameter")
 	}
 
 	if threads == 0 {
-		return fmt.Errorf("threads parameter must be positive")
+		return errors.New("invalid threads parameter")
 	}
 
 	a.time = time
@@ -179,11 +175,11 @@ func (a *Argon2Hasher) GetParameters() (uint32, uint32, uint8) {
 
 func (a *Argon2Hasher) SetSaltLength(length int) error {
 	if length <= 0 {
-		return fmt.Errorf("salt length must be positive")
+		return errors.New("invalid salt length")
 	}
 
 	if length > 1024 {
-		return fmt.Errorf("salt length too large: maximum 1024 bytes allowed")
+		return errors.New("salt length too large")
 	}
 
 	a.saltLen = length
@@ -196,11 +192,11 @@ func (a *Argon2Hasher) GetSaltLength() int {
 
 func (a *Argon2Hasher) SetKeyLength(length int) error {
 	if length <= 0 {
-		return fmt.Errorf("key length must be positive")
+		return errors.New("invalid key length")
 	}
 
 	if length > 1024 {
-		return fmt.Errorf("key length too large: maximum 1024 bytes allowed")
+		return errors.New("key length too large")
 	}
 
 	a.keyLen = length
@@ -213,15 +209,15 @@ func (a *Argon2Hasher) GetKeyLength() int {
 
 func (a *Argon2Hasher) validateInput(data []byte) error {
 	if data == nil {
-		return fmt.Errorf("input data cannot be nil")
+		return errors.New("input data cannot be nil")
 	}
 
 	if len(data) == 0 {
-		return fmt.Errorf("input data cannot be empty")
+		return errors.New("input data cannot be empty")
 	}
 
 	if len(data) > 1024*1024 {
-		return fmt.Errorf("input data too large: maximum 1MB allowed")
+		return errors.New("input data too large")
 	}
 
 	return nil
