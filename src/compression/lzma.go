@@ -5,6 +5,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+
+	"github.com/K9Crypt/k9crypt-go/src/constants"
 )
 
 type LzmaCompressor struct {
@@ -22,10 +24,6 @@ func NewLzmaCompressor() *LzmaCompressor {
 }
 
 func (lzma *LzmaCompressor) Compress(data []byte) ([]byte, error) {
-	if len(data) == 0 {
-		return nil, errors.New("compression error")
-	}
-
 	result := bytes.NewBuffer(make([]byte, 0, 131072))
 
 	err := lzma.writeHeader(result, len(data))
@@ -99,11 +97,18 @@ func (lzma *LzmaCompressor) readHeader(reader io.Reader) (int, error) {
 	if err != nil {
 		return 0, err
 	}
+	if propertiesByte[0] != 0x5d {
+		return 0, errors.New("invalid LZMA properties")
+	}
 
 	dictSizeBytes := make([]byte, 4)
 	_, err = reader.Read(dictSizeBytes)
 	if err != nil {
 		return 0, err
+	}
+	dictSize := binary.LittleEndian.Uint32(dictSizeBytes)
+	if dictSize == 0 || dictSize > uint32(lzma.windowSize) {
+		return 0, errors.New("invalid LZMA dictionary size")
 	}
 
 	uncompressedSizeBytes := make([]byte, 8)
@@ -112,8 +117,12 @@ func (lzma *LzmaCompressor) readHeader(reader io.Reader) (int, error) {
 		return 0, err
 	}
 
-	originalSize := int(binary.LittleEndian.Uint64(uncompressedSizeBytes))
-	return originalSize, nil
+	originalSize := binary.LittleEndian.Uint64(uncompressedSizeBytes)
+	if originalSize > uint64(constants.MaxPlaintextSize) {
+		return 0, errors.New("LZMA output too large")
+	}
+
+	return int(originalSize), nil
 }
 
 func (lzma *LzmaCompressor) simpleCompress(data []byte) ([]byte, error) {
@@ -139,6 +148,10 @@ func (lzma *LzmaCompressor) simpleCompress(data []byte) ([]byte, error) {
 }
 
 func (lzma *LzmaCompressor) simpleDecompress(data []byte, originalSize int) ([]byte, error) {
+	if originalSize == 0 {
+		return []byte{}, nil
+	}
+
 	result := bytes.NewBuffer(make([]byte, 0, 131072))
 	reader := bytes.NewReader(data)
 
@@ -182,7 +195,7 @@ func (lzma *LzmaCompressor) simpleDecompress(data []byte, originalSize int) ([]b
 
 	resultBytes := result.Bytes()
 	if len(resultBytes) < originalSize {
-		return resultBytes, nil
+		return nil, errors.New("decompression error")
 	}
 	return resultBytes[:originalSize], nil
 }

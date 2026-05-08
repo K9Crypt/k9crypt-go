@@ -17,6 +17,11 @@ type ZlibCompressor struct {
 	level int
 }
 
+type limitedBuffer struct {
+	bytes.Buffer
+	limit int
+}
+
 func NewZlibCompressor() *ZlibCompressor {
 	return &ZlibCompressor{
 		level: constants.CompressionLevel,
@@ -24,10 +29,6 @@ func NewZlibCompressor() *ZlibCompressor {
 }
 
 func (z *ZlibCompressor) Compress(data []byte) ([]byte, error) {
-	if len(data) == 0 {
-		return nil, errors.New("compression error")
-	}
-
 	compressed := bytes.NewBuffer(make([]byte, 0, 131072))
 
 	zlibHeader := []byte{0x78, 0x9c}
@@ -58,6 +59,10 @@ func (z *ZlibCompressor) Compress(data []byte) ([]byte, error) {
 }
 
 func (z *ZlibCompressor) Decompress(data []byte) ([]byte, error) {
+	return z.DecompressWithLimit(data, constants.MaxPlaintextSize)
+}
+
+func (z *ZlibCompressor) DecompressWithLimit(data []byte, limit int) ([]byte, error) {
 	if len(data) < 6 {
 		return nil, errors.New("decompression error")
 	}
@@ -69,7 +74,7 @@ func (z *ZlibCompressor) Decompress(data []byte) ([]byte, error) {
 	reader := bytes.NewReader(data[2 : len(data)-4])
 	deflateReader := flate.NewReader(reader)
 
-	decompressed := bytes.NewBuffer(make([]byte, 0, 131072))
+	decompressed := &limitedBuffer{limit: limit}
 	_, err := io.Copy(decompressed, deflateReader)
 	if err != nil {
 		deflateReader.Close()
@@ -89,6 +94,14 @@ func (z *ZlibCompressor) Decompress(data []byte) ([]byte, error) {
 	}
 
 	return decompressed.Bytes(), nil
+}
+
+func (b *limitedBuffer) Write(p []byte) (int, error) {
+	if b.limit >= 0 && b.Len()+len(p) > b.limit {
+		return 0, errors.New("decompression output too large")
+	}
+
+	return b.Buffer.Write(p)
 }
 
 func (z *ZlibCompressor) validateInput(data []byte) error {

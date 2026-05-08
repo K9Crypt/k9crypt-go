@@ -2,18 +2,19 @@ package k9crypt
 
 import (
 	"bytes"
-	"crypto/rand"
-	"encoding/base64"
+	"crypto/sha512"
 	"encoding/binary"
 	"errors"
-	"runtime"
+	"io"
 	"sync"
 
 	"github.com/K9Crypt/k9crypt-go/src/constants"
 )
 
 const (
-	ChunkSize = 64 * 1024
+	ChunkSize            = 64 * 1024
+	defaultBatchSize     = 1
+	maxParallelBatchSize = 2
 )
 
 type ProgressInfo struct {
@@ -30,332 +31,129 @@ type BatchProgressInfo struct {
 
 type EncryptFileOptions struct {
 	CompressionLevel int
+	TimeStepSeconds  uint32
+	IssuedAtUnix     *int64
 	OnProgress       func(ProgressInfo)
 }
 
 type DecryptFileOptions struct {
-	OnProgress func(ProgressInfo)
+	MaxAgeSeconds           *int64
+	AllowedClockSkewSeconds int64
+	NowUnixSeconds          *int64
+	AllowLegacyPayloads     *bool
+	OnProgress              func(ProgressInfo)
 }
 
 type EncryptManyOptions struct {
 	CompressionLevel int
+	TimeStepSeconds  uint32
+	IssuedAtUnix     *int64
 	Parallel         bool
 	BatchSize        int
 	OnProgress       func(BatchProgressInfo)
 }
 
 type DecryptManyOptions struct {
-	SkipInvalid bool
-	Parallel    bool
-	BatchSize   int
-	OnProgress  func(BatchProgressInfo)
-}
-
-func defaultBatchSize() int {
-	n := runtime.NumCPU() * 2
-	if n < 1 {
-		return 1
-	}
-	if n > 32 {
-		return 32
-	}
-	return n
+	MaxAgeSeconds           *int64
+	AllowedClockSkewSeconds int64
+	NowUnixSeconds          *int64
+	AllowLegacyPayloads     *bool
+	SkipInvalid             bool
+	Parallel                bool
+	BatchSize               int
+	OnProgress              func(BatchProgressInfo)
 }
 
 func (k *K9Crypt) EncryptFile(plaintext []byte, options *EncryptFileOptions) (string, error) {
-	if len(plaintext) == 0 {
+	input := plaintext
+	if input == nil {
+		input = []byte{}
+	}
+
+	if len(input) > constants.MaxBufferedFileSize {
 		return "", errors.New("stream encryption failed")
 	}
 
-	if len(plaintext) > constants.MaxPlaintextSize {
-		return "", errors.New("stream encryption failed")
-	}
-
-	if options == nil {
-		options = &EncryptFileOptions{}
-	}
-
-	if options.CompressionLevel < 0 || options.CompressionLevel > 9 {
-		options.CompressionLevel = constants.CompressionLevel
-	}
-
-	err := k.zlibCompressor.SetLevel(options.CompressionLevel)
+	encrypted, err := k.EncryptBytes(input, encryptFileOptions(options))
 	if err != nil {
 		return "", errors.New("stream encryption failed")
 	}
 
-	totalBytes := int64(len(plaintext))
-	processedBytes := int64(0)
-
-	var compressedChunks [][]byte
-	for i := 0; i < len(plaintext); i += ChunkSize {
-		end := i + ChunkSize
-		if end > len(plaintext) {
-			end = len(plaintext)
-		}
-
-		chunk := plaintext[i:end]
-		compressedChunk, err := k.compressData(chunk)
-		if err != nil {
-			return "", errors.New("stream encryption failed")
-		}
-
-		compressedChunks = append(compressedChunks, compressedChunk)
-		processedBytes += int64(len(chunk))
-
-		if options.OnProgress != nil {
-			options.OnProgress(ProgressInfo{
-				ProcessedBytes: processedBytes,
-				TotalBytes:     totalBytes,
-				Percentage:     float64(processedBytes) / float64(totalBytes) * 100,
-			})
-		}
+	if options != nil && options.OnProgress != nil {
+		reportFileProgress(options.OnProgress, int64(len(input)), int64(len(input)))
 	}
 
-	salt, err := k.argon2Hasher.GenerateSalt()
-	if err != nil {
-		return "", errors.New("stream encryption failed")
-	}
-
-	keys, err := k.deriveKeys(k.secretKey, salt)
-	if err != nil {
-		return "", errors.New("stream encryption failed")
-	}
-
-	var encryptedChunks [][]byte
-	for _, chunk := range compressedChunks {
-		encryptedChunk, err := k.aesEncryptor.MultiLayerEncrypt(chunk, keys)
-		if err != nil {
-			return "", errors.New("stream encryption failed")
-		}
-		encryptedChunks = append(encryptedChunks, encryptedChunk)
-	}
-
-	hash, err := k.generateHash(plaintext, salt)
-	if err != nil {
-		return "", errors.New("stream encryption failed")
-	}
-
-	buffer := bytes.NewBuffer(make([]byte, 0, 131072))
-
-	paddingSizeByte := make([]byte, 1)
-	_, err = rand.Read(paddingSizeByte)
-	if err != nil {
-		return "", errors.New("stream encryption failed")
-	}
-	paddingSize := byte(4 + int(paddingSizeByte[0])%13)
-	buffer.WriteByte(paddingSize)
-	padding := make([]byte, int(paddingSize))
-	_, err = rand.Read(padding)
-	if err != nil {
-		return "", errors.New("stream encryption failed")
-	}
-	buffer.Write(padding)
-
-	saltLen := make([]byte, 4)
-	binary.LittleEndian.PutUint32(saltLen, uint32(len(salt)))
-	buffer.Write(saltLen)
-	buffer.Write(salt)
-
-	hashLen := make([]byte, 4)
-	binary.LittleEndian.PutUint32(hashLen, uint32(len(hash)))
-	buffer.Write(hashLen)
-	buffer.Write(hash)
-
-	chunkCount := make([]byte, 4)
-	binary.LittleEndian.PutUint32(chunkCount, uint32(len(encryptedChunks)))
-	buffer.Write(chunkCount)
-
-	for _, chunk := range encryptedChunks {
-		chunkLen := make([]byte, 4)
-		binary.LittleEndian.PutUint32(chunkLen, uint32(len(chunk)))
-		buffer.Write(chunkLen)
-		buffer.Write(chunk)
-	}
-
-	return base64.StdEncoding.EncodeToString(buffer.Bytes()), nil
+	return encrypted, nil
 }
 
 func (k *K9Crypt) DecryptFile(encryptedData string, options *DecryptFileOptions) ([]byte, error) {
-	if len(encryptedData) == 0 {
-		return nil, errors.New("stream decryption failed")
-	}
-
-	if options == nil {
-		options = &DecryptFileOptions{}
-	}
-
-	decodedData, err := base64.StdEncoding.DecodeString(encryptedData)
+	decodedData, err := decodePayloadString(encryptedData)
 	if err != nil {
 		return nil, errors.New("stream decryption failed")
 	}
 
-	if len(decodedData) > constants.MaxCiphertextSize {
-		return nil, errors.New("stream decryption failed")
-	}
-
-	if len(decodedData) < constants.MinPayloadSize {
-		return nil, errors.New("stream decryption failed")
-	}
-
-	reader := bytes.NewReader(decodedData)
-
-	paddingSizeByte := make([]byte, 1)
-	_, err = reader.Read(paddingSizeByte)
-	if err != nil {
-		return nil, errors.New("stream decryption failed")
-	}
-	paddingSize := int(paddingSizeByte[0])
-	padding := make([]byte, paddingSize)
-	_, err = reader.Read(padding)
-	if err != nil {
-		return nil, errors.New("stream decryption failed")
-	}
-
-	saltLenBytes := make([]byte, 4)
-	_, err = reader.Read(saltLenBytes)
-	if err != nil {
-		return nil, errors.New("stream decryption failed")
-	}
-	saltLen := binary.LittleEndian.Uint32(saltLenBytes)
-
-	salt := make([]byte, saltLen)
-	_, err = reader.Read(salt)
-	if err != nil {
-		return nil, errors.New("stream decryption failed")
-	}
-
-	hashLenBytes := make([]byte, 4)
-	_, err = reader.Read(hashLenBytes)
-	if err != nil {
-		return nil, errors.New("stream decryption failed")
-	}
-	hashLen := binary.LittleEndian.Uint32(hashLenBytes)
-
-	hash := make([]byte, hashLen)
-	_, err = reader.Read(hash)
-	if err != nil {
-		return nil, errors.New("stream decryption failed")
-	}
-
-	chunkCountBytes := make([]byte, 4)
-	_, err = reader.Read(chunkCountBytes)
-	if err != nil {
-		return nil, errors.New("stream decryption failed")
-	}
-	chunkCount := binary.LittleEndian.Uint32(chunkCountBytes)
-
-	var encryptedChunks [][]byte
-	for i := uint32(0); i < chunkCount; i++ {
-		chunkLenBytes := make([]byte, 4)
-		_, err = reader.Read(chunkLenBytes)
-		if err != nil {
-			return nil, errors.New("stream decryption failed")
-		}
-		chunkLen := binary.LittleEndian.Uint32(chunkLenBytes)
-
-		chunk := make([]byte, chunkLen)
-		_, err = reader.Read(chunk)
-		if err != nil {
-			return nil, errors.New("stream decryption failed")
-		}
-		encryptedChunks = append(encryptedChunks, chunk)
-	}
-
-	keys, err := k.deriveKeys(k.secretKey, salt)
-	if err != nil {
-		return nil, errors.New("stream decryption failed")
-	}
-
-	var decryptedChunks [][]byte
-	totalChunks := len(encryptedChunks)
-	for i, chunk := range encryptedChunks {
-		decryptedChunk, err := k.aesEncryptor.MultiLayerDecrypt(chunk, keys)
+	decryptOptions := decryptFileOptions(options)
+	if hasVersionedPayload(decodedData) {
+		plaintext, err := k.decryptDecodedBytes(decodedData, decryptOptions)
 		if err != nil {
 			return nil, errors.New("stream decryption failed")
 		}
 
-		decompressedChunk, err := k.decompressData(decryptedChunk)
-		if err != nil {
+		if len(plaintext) > constants.MaxBufferedFileSize {
 			return nil, errors.New("stream decryption failed")
 		}
 
-		decryptedChunks = append(decryptedChunks, decompressedChunk)
-
-		if options.OnProgress != nil {
-			options.OnProgress(ProgressInfo{
-				ProcessedBytes: int64((i + 1) * ChunkSize),
-				TotalBytes:     int64(totalChunks * ChunkSize),
-				Percentage:     float64(i+1) / float64(totalChunks) * 100,
-			})
+		if options != nil && options.OnProgress != nil {
+			reportFileProgress(options.OnProgress, int64(len(plaintext)), int64(len(plaintext)))
 		}
+
+		return plaintext, nil
 	}
 
-	result := bytes.NewBuffer(make([]byte, 0, len(decryptedChunks)*ChunkSize))
-	for _, chunk := range decryptedChunks {
-		result.Write(chunk)
-	}
-
-	plaintext := result.Bytes()
-
-	if !k.verifyHash(plaintext, salt, hash) {
+	if !legacyPayloadsAllowed(decryptOptions) {
 		return nil, errors.New("stream decryption failed")
 	}
 
-	return plaintext, nil
+	return k.decryptLegacyFilePayload(decodedData, options)
 }
 
 func (k *K9Crypt) EncryptMany(dataArray []string, options *EncryptManyOptions) ([]string, error) {
 	if len(dataArray) == 0 {
-		return nil, errors.New("encryption failed")
+		return []string{}, nil
 	}
 
-	if options == nil {
-		options = &EncryptManyOptions{}
-	}
-
-	if options.BatchSize <= 0 {
-		options.BatchSize = defaultBatchSize()
-	}
-
-	for i, data := range dataArray {
-		if len(data) > constants.MaxPlaintextSize {
-			return nil, errors.New("encryption failed")
-		}
-		_ = i
-	}
-
-	if options.Parallel {
+	if options != nil && options.Parallel {
 		return k.encryptManyParallel(dataArray, options)
 	}
 
 	return k.encryptManySequential(dataArray, options)
 }
 
+func (k *K9Crypt) DecryptMany(ciphertextArray []string, options *DecryptManyOptions) ([]string, error) {
+	if len(ciphertextArray) == 0 {
+		return []string{}, nil
+	}
+
+	if options != nil && options.Parallel {
+		return k.decryptManyParallel(ciphertextArray, options)
+	}
+
+	return k.decryptManySequential(ciphertextArray, options)
+}
+
 func (k *K9Crypt) encryptManySequential(dataArray []string, options *EncryptManyOptions) ([]string, error) {
 	results := make([]string, len(dataArray))
+	encryptOptions := encryptManyOptions(options)
 	total := len(dataArray)
 
 	for i, data := range dataArray {
-		if data == "" {
-			results[i] = ""
-			continue
-		}
-
-		encrypted, err := k.Encrypt(data)
+		encrypted, err := k.EncryptWithOptions(data, encryptOptions)
 		if err != nil {
 			return nil, errors.New("encryption failed")
 		}
 
 		results[i] = encrypted
-
-		if options.OnProgress != nil {
-			options.OnProgress(BatchProgressInfo{
-				Current:    i + 1,
-				Total:      total,
-				Percentage: float64(i+1) / float64(total) * 100,
-			})
-		}
+		reportBatchProgress(optionEncryptProgress(options), i+1, total)
 	}
 
 	return results, nil
@@ -363,7 +161,10 @@ func (k *K9Crypt) encryptManySequential(dataArray []string, options *EncryptMany
 
 func (k *K9Crypt) encryptManyParallel(dataArray []string, options *EncryptManyOptions) ([]string, error) {
 	results := make([]string, len(dataArray))
-	batchSize := options.BatchSize
+	batchSize := resolveBatchSize(0)
+	if options != nil {
+		batchSize = resolveBatchSize(options.BatchSize)
+	}
 
 	for i := 0; i < len(dataArray); i += batchSize {
 		end := i + batchSize
@@ -376,15 +177,11 @@ func (k *K9Crypt) encryptManyParallel(dataArray []string, options *EncryptManyOp
 		var batchErr error
 
 		for j := i; j < end; j++ {
-			if dataArray[j] == "" {
-				continue
-			}
-
 			wg.Add(1)
 			go func(index int, plaintext string) {
 				defer wg.Done()
 
-				encrypted, err := k.Encrypt(plaintext)
+				encrypted, err := k.EncryptWithOptions(plaintext, encryptManyOptions(options))
 				if err != nil {
 					mu.Lock()
 					batchErr = errors.New("encryption failed")
@@ -396,79 +193,34 @@ func (k *K9Crypt) encryptManyParallel(dataArray []string, options *EncryptManyOp
 		}
 
 		wg.Wait()
-
 		if batchErr != nil {
 			return nil, batchErr
 		}
+
+		reportBatchProgress(optionEncryptProgress(options), end, len(dataArray))
 	}
 
 	return results, nil
 }
 
-func (k *K9Crypt) DecryptMany(ciphertextArray []string, options *DecryptManyOptions) ([]string, error) {
-	if len(ciphertextArray) == 0 {
-		return nil, errors.New("decryption failed")
-	}
-
-	if options == nil {
-		options = &DecryptManyOptions{}
-	}
-
-	if options.BatchSize <= 0 {
-		options.BatchSize = defaultBatchSize()
-	}
-
-	for i, data := range ciphertextArray {
-		if data == "" {
-			continue
-		}
-		if len(data) > constants.MaxCiphertextSize {
-			return nil, errors.New("decryption failed")
-		}
-		if len(data) < constants.MinPayloadSize {
-			if options.SkipInvalid {
-				continue
-			}
-			return nil, errors.New("decryption failed")
-		}
-		_ = i
-	}
-
-	if options.Parallel {
-		return k.decryptManyParallel(ciphertextArray, options)
-	}
-
-	return k.decryptManySequential(ciphertextArray, options)
-}
-
 func (k *K9Crypt) decryptManySequential(ciphertextArray []string, options *DecryptManyOptions) ([]string, error) {
 	results := make([]string, len(ciphertextArray))
+	decryptOptions := decryptManyOptions(options)
 	total := len(ciphertextArray)
 
 	for i, ciphertext := range ciphertextArray {
-		if ciphertext == "" {
-			results[i] = ""
-			continue
-		}
-
-		decrypted, err := k.Decrypt(ciphertext)
+		decrypted, err := k.DecryptWithOptions(ciphertext, decryptOptions)
 		if err != nil {
-			if options.SkipInvalid {
+			if options != nil && options.SkipInvalid {
 				results[i] = ""
+				reportBatchProgress(optionDecryptProgress(options), i+1, total)
 				continue
 			}
 			return nil, errors.New("decryption failed")
 		}
 
 		results[i] = decrypted
-
-		if options.OnProgress != nil {
-			options.OnProgress(BatchProgressInfo{
-				Current:    i + 1,
-				Total:      total,
-				Percentage: float64(i+1) / float64(total) * 100,
-			})
-		}
+		reportBatchProgress(optionDecryptProgress(options), i+1, total)
 	}
 
 	return results, nil
@@ -476,7 +228,10 @@ func (k *K9Crypt) decryptManySequential(ciphertextArray []string, options *Decry
 
 func (k *K9Crypt) decryptManyParallel(ciphertextArray []string, options *DecryptManyOptions) ([]string, error) {
 	results := make([]string, len(ciphertextArray))
-	batchSize := options.BatchSize
+	batchSize := resolveBatchSize(0)
+	if options != nil {
+		batchSize = resolveBatchSize(options.BatchSize)
+	}
 
 	for i := 0; i < len(ciphertextArray); i += batchSize {
 		end := i + batchSize
@@ -489,17 +244,13 @@ func (k *K9Crypt) decryptManyParallel(ciphertextArray []string, options *Decrypt
 		var batchErr error
 
 		for j := i; j < end; j++ {
-			if ciphertextArray[j] == "" {
-				continue
-			}
-
 			wg.Add(1)
 			go func(index int, encrypted string) {
 				defer wg.Done()
 
-				decrypted, err := k.Decrypt(encrypted)
+				decrypted, err := k.DecryptWithOptions(encrypted, decryptManyOptions(options))
 				if err != nil {
-					if options.SkipInvalid {
+					if options != nil && options.SkipInvalid {
 						results[index] = ""
 						return
 					}
@@ -513,11 +264,247 @@ func (k *K9Crypt) decryptManyParallel(ciphertextArray []string, options *Decrypt
 		}
 
 		wg.Wait()
-
 		if batchErr != nil {
 			return nil, batchErr
 		}
+
+		reportBatchProgress(optionDecryptProgress(options), end, len(ciphertextArray))
 	}
 
 	return results, nil
+}
+
+func (k *K9Crypt) decryptLegacyFilePayload(decodedData []byte, options *DecryptFileOptions) ([]byte, error) {
+	if len(decodedData) < constants.LegacyMinPayloadSize+4 {
+		return nil, errors.New("stream decryption failed")
+	}
+
+	reader := bytes.NewReader(decodedData)
+	paddingSizeByte, err := reader.ReadByte()
+	if err != nil {
+		return nil, errors.New("stream decryption failed")
+	}
+
+	paddingSize := int(paddingSizeByte)
+	if paddingSize < 4 || paddingSize > 16 || reader.Len() < paddingSize+4 {
+		return nil, errors.New("stream decryption failed")
+	}
+
+	_, err = reader.Seek(int64(paddingSize), io.SeekCurrent)
+	if err != nil {
+		return nil, errors.New("stream decryption failed")
+	}
+
+	saltLen, err := readUint32Little(reader)
+	if err != nil {
+		return nil, errors.New("stream decryption failed")
+	}
+
+	if saltLen != constants.Argon2SaltSize || reader.Len() < int(saltLen)+4 {
+		return nil, errors.New("stream decryption failed")
+	}
+
+	salt := make([]byte, saltLen)
+	_, err = io.ReadFull(reader, salt)
+	if err != nil {
+		return nil, errors.New("stream decryption failed")
+	}
+
+	hashLen, err := readUint32Little(reader)
+	if err != nil {
+		return nil, errors.New("stream decryption failed")
+	}
+
+	if hashLen != sha512.Size || reader.Len() < int(hashLen)+4 {
+		return nil, errors.New("stream decryption failed")
+	}
+
+	hash := make([]byte, hashLen)
+	_, err = io.ReadFull(reader, hash)
+	if err != nil {
+		return nil, errors.New("stream decryption failed")
+	}
+
+	chunkCountBytes := make([]byte, 4)
+	_, err = io.ReadFull(reader, chunkCountBytes)
+	if err != nil {
+		return nil, errors.New("stream decryption failed")
+	}
+	chunkCount := binary.LittleEndian.Uint32(chunkCountBytes)
+	maxChunks := uint32(constants.MaxBufferedFileSize/ChunkSize + 1)
+	if chunkCount == 0 || chunkCount > maxChunks {
+		return nil, errors.New("stream decryption failed")
+	}
+
+	encryptedChunks := make([][]byte, 0, chunkCount)
+	for i := uint32(0); i < chunkCount; i++ {
+		chunkLen, readErr := readUint32Little(reader)
+		if readErr != nil {
+			return nil, errors.New("stream decryption failed")
+		}
+
+		if chunkLen == 0 || int(chunkLen) > reader.Len() {
+			return nil, errors.New("stream decryption failed")
+		}
+
+		chunk := make([]byte, chunkLen)
+		_, readErr = io.ReadFull(reader, chunk)
+		if readErr != nil {
+			return nil, errors.New("stream decryption failed")
+		}
+		encryptedChunks = append(encryptedChunks, chunk)
+	}
+
+	if reader.Len() != 0 {
+		return nil, errors.New("stream decryption failed")
+	}
+
+	keys, err := k.deriveKeys(k.secretKey, salt)
+	if err != nil {
+		return nil, errors.New("stream decryption failed")
+	}
+
+	result := bytes.NewBuffer(make([]byte, 0, len(encryptedChunks)*ChunkSize))
+	for i, chunk := range encryptedChunks {
+		decryptedChunk, decryptErr := k.aesEncryptor.MultiLayerDecrypt(chunk, keys)
+		if decryptErr != nil {
+			return nil, errors.New("stream decryption failed")
+		}
+
+		decompressedChunk, decompressErr := k.decompressData(decryptedChunk)
+		if decompressErr != nil {
+			return nil, errors.New("stream decryption failed")
+		}
+
+		if result.Len()+len(decompressedChunk) > constants.MaxBufferedFileSize {
+			return nil, errors.New("stream decryption failed")
+		}
+
+		result.Write(decompressedChunk)
+		reportFileProgress(optionFileProgress(options), int64(i+1), int64(len(encryptedChunks)))
+	}
+
+	plaintext := result.Bytes()
+	if !k.verifyHash(plaintext, salt, hash) {
+		return nil, errors.New("stream decryption failed")
+	}
+
+	return plaintext, nil
+}
+
+func encryptFileOptions(options *EncryptFileOptions) *EncryptOptions {
+	if options == nil {
+		return nil
+	}
+
+	level := options.CompressionLevel
+	return &EncryptOptions{
+		CompressionLevel: &level,
+		TimeStepSeconds:  options.TimeStepSeconds,
+		IssuedAtUnix:     options.IssuedAtUnix,
+	}
+}
+
+func decryptFileOptions(options *DecryptFileOptions) *DecryptOptions {
+	if options == nil {
+		return nil
+	}
+
+	return &DecryptOptions{
+		MaxAgeSeconds:           options.MaxAgeSeconds,
+		AllowedClockSkewSeconds: options.AllowedClockSkewSeconds,
+		NowUnixSeconds:          options.NowUnixSeconds,
+		AllowLegacyPayloads:     options.AllowLegacyPayloads,
+	}
+}
+
+func encryptManyOptions(options *EncryptManyOptions) *EncryptOptions {
+	if options == nil {
+		return nil
+	}
+
+	level := options.CompressionLevel
+	return &EncryptOptions{
+		CompressionLevel: &level,
+		TimeStepSeconds:  options.TimeStepSeconds,
+		IssuedAtUnix:     options.IssuedAtUnix,
+	}
+}
+
+func decryptManyOptions(options *DecryptManyOptions) *DecryptOptions {
+	if options == nil {
+		return nil
+	}
+
+	return &DecryptOptions{
+		MaxAgeSeconds:           options.MaxAgeSeconds,
+		AllowedClockSkewSeconds: options.AllowedClockSkewSeconds,
+		NowUnixSeconds:          options.NowUnixSeconds,
+		AllowLegacyPayloads:     options.AllowLegacyPayloads,
+	}
+}
+
+func resolveBatchSize(value int) int {
+	if value <= 0 {
+		return defaultBatchSize
+	}
+
+	if value > maxParallelBatchSize {
+		return maxParallelBatchSize
+	}
+
+	return value
+}
+
+func reportFileProgress(onProgress func(ProgressInfo), processedBytes int64, totalBytes int64) {
+	if onProgress == nil {
+		return
+	}
+
+	percentage := 100.0
+	if totalBytes > 0 {
+		percentage = float64(processedBytes) / float64(totalBytes) * 100
+	}
+
+	onProgress(ProgressInfo{
+		ProcessedBytes: processedBytes,
+		TotalBytes:     totalBytes,
+		Percentage:     percentage,
+	})
+}
+
+func reportBatchProgress(onProgress func(BatchProgressInfo), current int, total int) {
+	if onProgress == nil || total == 0 {
+		return
+	}
+
+	onProgress(BatchProgressInfo{
+		Current:    current,
+		Total:      total,
+		Percentage: float64(current) / float64(total) * 100,
+	})
+}
+
+func optionFileProgress(options *DecryptFileOptions) func(ProgressInfo) {
+	if options == nil {
+		return nil
+	}
+
+	return options.OnProgress
+}
+
+func optionEncryptProgress(options *EncryptManyOptions) func(BatchProgressInfo) {
+	if options == nil {
+		return nil
+	}
+
+	return options.OnProgress
+}
+
+func optionDecryptProgress(options *DecryptManyOptions) func(BatchProgressInfo) {
+	if options == nil {
+		return nil
+	}
+
+	return options.OnProgress
 }

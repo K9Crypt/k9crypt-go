@@ -6,12 +6,19 @@ import (
 	"crypto/rand"
 	"errors"
 	"fmt"
+	"io"
 
 	"github.com/K9Crypt/k9crypt-go/src/constants"
 )
 
 type AesEncryptor struct {
 	modes []constants.AesMode
+}
+
+type CipherChainResult struct {
+	Ivs       [][]byte
+	Encrypted []byte
+	Tag       []byte
 }
 
 func NewAesEncryptor() *AesEncryptor {
@@ -26,9 +33,91 @@ func NewAesEncryptor() *AesEncryptor {
 	}
 }
 
+func (a *AesEncryptor) EncryptVersioned(data []byte, key []byte, aad []byte) (*CipherChainResult, error) {
+	if len(key) != constants.KeySize {
+		return nil, errors.New("encryption failed")
+	}
+
+	ivs, err := a.generateIvs(5)
+	if err != nil {
+		return nil, errors.New("encryption failed")
+	}
+
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, errors.New("encryption failed")
+	}
+
+	gcm, err := cipher.NewGCMWithNonceSize(block, constants.IvSize)
+	if err != nil {
+		return nil, errors.New("encryption failed")
+	}
+
+	sealed := gcm.Seal(nil, ivs[0], data, aad)
+	if len(sealed) < constants.TagSize {
+		return nil, errors.New("encryption failed")
+	}
+
+	tagOffset := len(sealed) - constants.TagSize
+	result := make([]byte, tagOffset)
+	copy(result, sealed[:tagOffset])
+	tag := make([]byte, constants.TagSize)
+	copy(tag, sealed[tagOffset:])
+
+	result = a.encryptCbcPayload(result, block, ivs[1])
+	result = a.encryptCfbPayload(result, block, ivs[2])
+	result = a.encryptOfbPayload(result, block, ivs[3])
+	result = a.encryptCtrPayload(result, block, ivs[4])
+	result = reverseCopy(result)
+
+	return &CipherChainResult{Ivs: ivs, Encrypted: result, Tag: tag}, nil
+}
+
+func (a *AesEncryptor) DecryptVersioned(data []byte, key []byte, ivs [][]byte, tag []byte, aad []byte) ([]byte, error) {
+	if len(data) == 0 || len(key) != constants.KeySize || len(ivs) != 5 || len(tag) != constants.TagSize {
+		return nil, errors.New("decryption failed")
+	}
+
+	for _, iv := range ivs {
+		if len(iv) != constants.IvSize {
+			return nil, errors.New("decryption failed")
+		}
+	}
+
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, errors.New("decryption failed")
+	}
+
+	result := reverseCopy(data)
+	result = a.decryptCtrPayload(result, block, ivs[4])
+	result = a.decryptOfbPayload(result, block, ivs[3])
+	result = a.decryptCfbPayload(result, block, ivs[2])
+	result, err = a.decryptCbcPayload(result, block, ivs[1])
+	if err != nil {
+		return nil, errors.New("decryption failed")
+	}
+
+	gcm, err := cipher.NewGCMWithNonceSize(block, constants.IvSize)
+	if err != nil {
+		return nil, errors.New("decryption failed")
+	}
+
+	sealed := make([]byte, len(result)+len(tag))
+	copy(sealed, result)
+	copy(sealed[len(result):], tag)
+
+	plaintext, err := gcm.Open(nil, ivs[0], sealed, aad)
+	if err != nil {
+		return nil, errors.New("decryption failed")
+	}
+
+	return plaintext, nil
+}
+
 func (a *AesEncryptor) GenerateKey() ([]byte, error) {
 	key := make([]byte, constants.KeySize)
-	_, err := rand.Read(key)
+	_, err := io.ReadFull(rand.Reader, key)
 	if err != nil {
 		return nil, errors.New("key generation failed")
 	}
@@ -37,7 +126,7 @@ func (a *AesEncryptor) GenerateKey() ([]byte, error) {
 
 func (a *AesEncryptor) GenerateIv() ([]byte, error) {
 	iv := make([]byte, constants.IvSize)
-	_, err := rand.Read(iv)
+	_, err := io.ReadFull(rand.Reader, iv)
 	if err != nil {
 		return nil, errors.New("IV generation failed")
 	}
@@ -51,7 +140,7 @@ func (a *AesEncryptor) generateIvs(count int) ([][]byte, error) {
 
 	totalBytes := count * constants.IvSize
 	raw := make([]byte, totalBytes)
-	_, err := rand.Read(raw)
+	_, err := io.ReadFull(rand.Reader, raw)
 	if err != nil {
 		return nil, errors.New("IV generation failed")
 	}
@@ -176,7 +265,7 @@ func (a *AesEncryptor) encryptGcm(data []byte, block cipher.Block) ([]byte, erro
 	}
 
 	nonce := make([]byte, gcm.NonceSize())
-	_, err = rand.Read(nonce)
+	_, err = io.ReadFull(rand.Reader, nonce)
 	if err != nil {
 		return nil, errors.New("encryption failed")
 	}
@@ -324,6 +413,78 @@ func (a *AesEncryptor) decryptCtr(data []byte, block cipher.Block) ([]byte, erro
 	stream.XORKeyStream(plaintext, ciphertext)
 
 	return plaintext, nil
+}
+
+func (a *AesEncryptor) encryptCbcPayload(data []byte, block cipher.Block, iv []byte) []byte {
+	blockSize := block.BlockSize()
+	padded := a.pkcs7Pad(data, blockSize)
+	ciphertext := make([]byte, len(padded))
+	mode := cipher.NewCBCEncrypter(block, iv)
+	mode.CryptBlocks(ciphertext, padded)
+	return ciphertext
+}
+
+func (a *AesEncryptor) decryptCbcPayload(data []byte, block cipher.Block, iv []byte) ([]byte, error) {
+	blockSize := block.BlockSize()
+	if len(data) == 0 || len(data)%blockSize != 0 {
+		return nil, errors.New("decryption failed")
+	}
+
+	plaintext := make([]byte, len(data))
+	mode := cipher.NewCBCDecrypter(block, iv)
+	mode.CryptBlocks(plaintext, data)
+
+	return a.pkcs7Unpad(plaintext)
+}
+
+func (a *AesEncryptor) encryptCfbPayload(data []byte, block cipher.Block, iv []byte) []byte {
+	ciphertext := make([]byte, len(data))
+	stream := cipher.NewCFBEncrypter(block, iv)
+	stream.XORKeyStream(ciphertext, data)
+	return ciphertext
+}
+
+func (a *AesEncryptor) decryptCfbPayload(data []byte, block cipher.Block, iv []byte) []byte {
+	plaintext := make([]byte, len(data))
+	stream := cipher.NewCFBDecrypter(block, iv)
+	stream.XORKeyStream(plaintext, data)
+	return plaintext
+}
+
+func (a *AesEncryptor) encryptOfbPayload(data []byte, block cipher.Block, iv []byte) []byte {
+	ciphertext := make([]byte, len(data))
+	stream := cipher.NewOFB(block, iv)
+	stream.XORKeyStream(ciphertext, data)
+	return ciphertext
+}
+
+func (a *AesEncryptor) decryptOfbPayload(data []byte, block cipher.Block, iv []byte) []byte {
+	plaintext := make([]byte, len(data))
+	stream := cipher.NewOFB(block, iv)
+	stream.XORKeyStream(plaintext, data)
+	return plaintext
+}
+
+func (a *AesEncryptor) encryptCtrPayload(data []byte, block cipher.Block, iv []byte) []byte {
+	ciphertext := make([]byte, len(data))
+	stream := cipher.NewCTR(block, iv)
+	stream.XORKeyStream(ciphertext, data)
+	return ciphertext
+}
+
+func (a *AesEncryptor) decryptCtrPayload(data []byte, block cipher.Block, iv []byte) []byte {
+	plaintext := make([]byte, len(data))
+	stream := cipher.NewCTR(block, iv)
+	stream.XORKeyStream(plaintext, data)
+	return plaintext
+}
+
+func reverseCopy(data []byte) []byte {
+	result := make([]byte, len(data))
+	for i := range data {
+		result[i] = data[len(data)-1-i]
+	}
+	return result
 }
 
 func (a *AesEncryptor) pkcs7Pad(data []byte, blockSize int) []byte {

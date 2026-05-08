@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"errors"
 	"fmt"
+	"io"
 
 	"github.com/K9Crypt/k9crypt-go/src/constants"
 
@@ -31,7 +32,7 @@ func NewArgon2Hasher() *Argon2Hasher {
 
 func (a *Argon2Hasher) GenerateSalt() ([]byte, error) {
 	salt := make([]byte, a.saltLen)
-	_, err := rand.Read(salt)
+	_, err := io.ReadFull(rand.Reader, salt)
 	if err != nil {
 		return nil, fmt.Errorf("salt generation failed")
 	}
