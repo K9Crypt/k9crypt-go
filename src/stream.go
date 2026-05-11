@@ -114,6 +114,23 @@ func (k *K9Crypt) DecryptFile(encryptedData string, options *DecryptFileOptions)
 		return nil, errors.New("stream decryption failed")
 	}
 
+	if looksLikeLengthPrefixedLegacyPayload(decodedData) {
+		return k.decryptLegacyFilePayload(decodedData, options)
+	}
+
+	plaintext, err := k.decryptLegacyV1Payload(decodedData)
+	if err == nil {
+		if len(plaintext) > constants.MaxBufferedFileSize {
+			return nil, errors.New("stream decryption failed")
+		}
+
+		if options != nil && options.OnProgress != nil {
+			reportFileProgress(options.OnProgress, int64(len(plaintext)), int64(len(plaintext)))
+		}
+
+		return plaintext, nil
+	}
+
 	return k.decryptLegacyFilePayload(decodedData, options)
 }
 

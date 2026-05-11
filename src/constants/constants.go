@@ -6,6 +6,7 @@ import (
 
 const (
 	PayloadCurrentVersion = 4
+	PayloadVersionV1      = 1
 	PayloadVersionV2      = 2
 	PayloadVersionV3      = 3
 	PayloadVersionV4      = 4

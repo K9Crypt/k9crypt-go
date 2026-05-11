@@ -299,6 +299,15 @@ func (k *K9Crypt) decryptDecodedBytes(decodedData []byte, options *DecryptOption
 		return nil, errors.New("decryption failed")
 	}
 
+	if looksLikeLengthPrefixedLegacyPayload(decodedData) {
+		return k.decryptLegacyPayload(decodedData)
+	}
+
+	plaintext, err := k.decryptLegacyV1Payload(decodedData)
+	if err == nil {
+		return plaintext, nil
+	}
+
 	return k.decryptLegacyPayload(decodedData)
 }
 
@@ -346,6 +355,41 @@ func (k *K9Crypt) decryptVersionedPayload(decodedData []byte, options *DecryptOp
 		if err != nil {
 			return nil, errors.New("decryption failed")
 		}
+	}
+
+	if len(plaintext) > constants.MaxPlaintextSize {
+		return nil, errors.New("decryption failed")
+	}
+
+	result := make([]byte, len(plaintext))
+	copy(result, plaintext)
+	return result, nil
+}
+
+func (k *K9Crypt) decryptLegacyV1Payload(decodedData []byte) ([]byte, error) {
+	payload, err := parseLegacyV1Payload(decodedData)
+	if err != nil {
+		return nil, errors.New("decryption failed")
+	}
+
+	if !verifyVersionedHash(payload.body, payload.dataHash, payload.integritySalt, nil) {
+		return nil, errors.New("decryption failed")
+	}
+
+	key, err := k.derivePayloadKey(payload.salt, nil)
+	if err != nil {
+		return nil, errors.New("decryption failed")
+	}
+	defer zeroBytes(key)
+
+	decryptedData, err := k.aesEncryptor.DecryptVersioned(payload.encrypted, key, payload.ivs, payload.tag, nil)
+	if err != nil {
+		return nil, errors.New("decryption failed")
+	}
+
+	plaintext, err := k.decompressData(decryptedData)
+	if err != nil {
+		return nil, errors.New("decryption failed")
 	}
 
 	if len(plaintext) > constants.MaxPlaintextSize {
@@ -708,6 +752,39 @@ func secureRandomBytes(size int) ([]byte, error) {
 	}
 
 	return data, nil
+}
+
+func looksLikeLengthPrefixedLegacyPayload(data []byte) bool {
+	if len(data) < constants.LegacyMinPayloadSize {
+		return false
+	}
+
+	paddingSize := int(data[0])
+	if paddingSize < 4 || paddingSize > 16 {
+		return false
+	}
+
+	saltLenOffset := 1 + paddingSize
+	if len(data) < saltLenOffset+4+constants.Argon2SaltSize+4 {
+		return false
+	}
+
+	saltLen := binary.LittleEndian.Uint32(data[saltLenOffset : saltLenOffset+4])
+	if saltLen != constants.Argon2SaltSize {
+		return false
+	}
+
+	hashLenOffset := saltLenOffset + 4 + constants.Argon2SaltSize
+	if len(data) < hashLenOffset+4 {
+		return false
+	}
+
+	hashLen := binary.LittleEndian.Uint32(data[hashLenOffset : hashLenOffset+4])
+	if hashLen != sha512.Size {
+		return false
+	}
+
+	return true
 }
 
 func readUint32Little(reader *bytes.Reader) (uint32, error) {

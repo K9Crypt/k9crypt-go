@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/base64"
 	"encoding/binary"
+	"errors"
 	"testing"
 
 	"github.com/K9Crypt/k9crypt-go/src/constants"
@@ -437,6 +438,29 @@ func TestBatchSequentialParallelAndSkipInvalid(t *testing.T) {
 	}
 }
 
+func TestLegacyV1PayloadCompatibility(t *testing.T) {
+	encryptor, err := New("VeryLongSecretKey!@#1234567890")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	legacy := buildLegacyV1Payload(t, encryptor, []byte("legacy v1 string"))
+	decrypted, err := encryptor.Decrypt(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if decrypted != "legacy v1 string" {
+		t.Fatal("legacy v1 string mismatch")
+	}
+
+	allowLegacy := false
+	_, err = encryptor.DecryptWithOptions(legacy, &DecryptOptions{AllowLegacyPayloads: &allowLegacy})
+	if err == nil {
+		t.Fatal("strict legacy policy accepted legacy v1 payload")
+	}
+}
+
 func TestLegacyPayloadCompatibility(t *testing.T) {
 	encryptor, err := New("VeryLongSecretKey!@#1234567890")
 	if err != nil {
@@ -535,6 +559,75 @@ func TestLegacyHashHelpersAndCompressionBranches(t *testing.T) {
 	if err == nil {
 		t.Fatal("invalid decompression type was accepted")
 	}
+}
+
+func buildLegacyV1Payload(t *testing.T, encryptor *K9Crypt, plaintext []byte) string {
+	t.Helper()
+
+	compressed, err := encryptor.compressData(plaintext)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	salt, err := secureRandomBytes(constants.SaltSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	key, err := encryptor.derivePayloadKey(salt, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer zeroBytes(key)
+
+	encrypted, err := encryptor.aesEncryptor.EncryptVersioned(compressed, key, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body, err := createLegacyV1Body(salt, encrypted.Ivs, encrypted.Encrypted, encrypted.Tag)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	integritySalt, err := secureRandomBytes(constants.Argon2SaltSize)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	digest := computeVersionedHmac(body, nil)
+	hash := argon2.IDKey(digest, integritySalt, constants.Argon2Time, constants.Argon2Memory, constants.Argon2Threads, constants.Argon2HashLength)
+	zeroBytes(digest)
+
+	result := make([]byte, 0, len(body)+len(integritySalt)+len(hash))
+	result = append(result, body...)
+	result = append(result, integritySalt...)
+	result = append(result, hash...)
+	return base64.StdEncoding.EncodeToString(result)
+}
+
+func createLegacyV1Body(salt []byte, ivs [][]byte, encrypted []byte, tag []byte) ([]byte, error) {
+	if len(salt) != constants.SaltSize || len(ivs) != 5 || len(encrypted) == 0 || len(tag) != constants.TagSize {
+		return nil, errors.New("invalid legacy v1 payload")
+	}
+
+	body := make([]byte, constants.SaltSize+5*constants.IvSize+len(encrypted)+constants.TagSize)
+	offset := 0
+	copy(body[offset:], salt)
+	offset += constants.SaltSize
+
+	for _, iv := range ivs {
+		if len(iv) != constants.IvSize {
+			return nil, errors.New("invalid legacy v1 iv")
+		}
+		copy(body[offset:], iv)
+		offset += constants.IvSize
+	}
+
+	copy(body[offset:], encrypted)
+	offset += len(encrypted)
+	copy(body[offset:], tag)
+	return body, nil
 }
 
 func buildLegacyPayload(t *testing.T, encryptor *K9Crypt, plaintext []byte) string {

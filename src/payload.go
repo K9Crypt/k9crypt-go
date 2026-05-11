@@ -159,6 +159,43 @@ func parseVersionedPayload(data []byte) (*versionedPayload, error) {
 	return payload, nil
 }
 
+func parseLegacyV1Payload(data []byte) (*versionedPayload, error) {
+	if len(data) < constants.MinPayloadSize {
+		return nil, errors.New("payload too small")
+	}
+
+	trailerOffset := len(data) - constants.Argon2HashLength - constants.Argon2SaltSize
+	tagOffset := trailerOffset - constants.TagSize
+	saltOffset := 0
+	ivOffset := saltOffset + constants.SaltSize
+	encryptedOffset := ivOffset + 5*constants.IvSize
+
+	if encryptedOffset >= tagOffset {
+		return nil, errors.New("payload too small")
+	}
+
+	ivs := make([][]byte, 5)
+	for i := 0; i < 5; i++ {
+		start := ivOffset + i*constants.IvSize
+		ivs[i] = data[start : start+constants.IvSize]
+	}
+
+	payload := &versionedPayload{
+		version:       byte(constants.PayloadVersionV1),
+		header:        nil,
+		timeMetadata:  nil,
+		body:          data[:trailerOffset],
+		salt:          data[saltOffset:ivOffset],
+		ivs:           ivs,
+		encrypted:     data[encryptedOffset:tagOffset],
+		tag:           data[tagOffset:trailerOffset],
+		integritySalt: data[trailerOffset : trailerOffset+constants.Argon2SaltSize],
+		dataHash:      data[trailerOffset+constants.Argon2SaltSize:],
+	}
+
+	return payload, nil
+}
+
 func parsePayloadHeader(header []byte) (*timeMetadata, error) {
 	if len(header) != constants.PayloadHeaderSize {
 		return nil, errors.New("invalid payload header")
